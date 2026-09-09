@@ -33,6 +33,18 @@ class Book:
         """全局唯一标识（书源 + 详情页地址）。"""
         return f"{self.source}|{self.url}"
 
+    @classmethod
+    def from_record(cls, record: Dict) -> "Book":
+        """从书架/历史记录（dict）还原成 Book。"""
+        record = record or {}
+        return cls(
+            title=record.get("title", ""), author=record.get("author", ""),
+            url=record.get("url", ""), cover_url=record.get("cover_url", ""),
+            intro=record.get("intro", ""), source=record.get("source", ""),
+            source_name=record.get("source_name", ""),
+            category=record.get("category", ""), status=record.get("status", ""),
+            latest_chapter=record.get("latest_chapter", ""))
+
     def merge(self, other: "Book") -> "Book":
         """用更完整的信息补齐当前对象（例如用详情页信息补全搜索结果）。"""
         for name in ("title", "author", "url", "cover_url", "intro", "category",

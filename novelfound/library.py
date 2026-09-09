@@ -120,8 +120,13 @@ class Library:
         return record
 
     def update_progress(self, book: Book, chapter_url: str, chapter_title: str,
-                        index: int, scroll_pos: int = 0) -> None:
-        """记录阅读进度；书架内与历史记录同步更新。"""
+                        index: int, scroll_pos: int = 0, block_index: int = -1,
+                        page_index: int = -1, char_offset: int = -1) -> None:
+        """记录阅读进度；书架内与历史记录同步更新。
+
+        ``char_offset`` 是整章显示文本的字符偏移，跨排版/尺寸都稳定，是主锚点；
+        ``scroll_pos`` 只在滚动模式下有意义，``block_index`` / ``page_index`` 兼容旧数据。
+        """
         with self._lock:
             targets = [self._touch_history(book)]
             shelf = self._data["books"].get(book.key)
@@ -132,6 +137,9 @@ class Library:
                 record["last_chapter_title"] = chapter_title
                 record["last_index"] = int(index)
                 record["scroll_pos"] = int(scroll_pos)
+                record["block_index"] = int(block_index)
+                record["page_index"] = int(page_index)
+                record["char_offset"] = int(char_offset)
                 record["last_read_at"] = time.time()
             recent = [r for r in self._data["recent"] if r != book.key]
             recent.insert(0, book.key)
@@ -158,6 +166,9 @@ class Library:
             "chapter_title": record.get("last_chapter_title", ""),
             "index": record.get("last_index", 0),
             "scroll_pos": record.get("scroll_pos", 0),
+            "block_index": record.get("block_index", -1),
+            "page_index": record.get("page_index", -1),
+            "char_offset": record.get("char_offset", -1),
         }
 
     def history(self) -> List[Dict[str, Any]]:

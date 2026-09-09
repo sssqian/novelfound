@@ -64,12 +64,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "line_height": 1.9,             # 行距倍数
     "paragraph_spacing": 12,        # 段间距（像素）
     "first_line_indent": 2,         # 首行缩进（字符数，0 = 不缩进）
-    "reader_theme": "eye",          # day / eye / sepia / night / dark
+    "reader_theme": "warm",         # warm / eye / sepia / night / dark
     "reader_mode": "scroll",        # scroll（滚动）/ page（翻页）
-    "content_width": 820,           # 正文最大宽度（像素）
+    "page_columns": 1,              # 翻页模式下的排版：1 = 单页，2 = 左右双页
+    "content_width": 820,           # 正文最大宽度（像素），一行太长会读不下去
+    "auto_hide_bars": True,         # 阅读时上下控制条自动隐藏（鼠标靠近才出现）
     "strict_ad_filter": True,       # 更激进的广告过滤
     "auto_load_cover": True,        # 自动加载封面
-    "auto_hide_sidebar": True,      # 进入阅读器时自动收起左侧栏
     # ---- 网络 ----
     "timeout": 12.0,
     "retries": 2,
@@ -89,11 +90,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "discover_engine": "",          # 搜索引擎（空 = 自动）
     # ---- 界面 ----
     "last_search": "",
+    "toast_seconds": 6,             # 底部轻提示显示时长
+    "search_debounce_ms": 300,      # 搜索浮层输入防抖（毫秒）
     "window_geometry": "",          # base64 编码的窗口尺寸
     "window_state": "",
-    "splitter_sizes": [],
-    "sidebar_visible": True,
 }
+
+# P1 起废弃的键（左侧栏 → 目录抽屉）：读到就忽略并清理
+DEPRECATED_KEYS = ("sidebar_visible", "auto_hide_sidebar", "splitter_sizes")
 
 
 class AppConfig:
@@ -114,6 +118,9 @@ class AppConfig:
             if isinstance(loaded, dict):
                 for key, value in loaded.items():
                     self._data[key] = value
+            # P1：左侧栏已被目录抽屉取代，清掉旧键避免残留产生怪异行为
+            for key in DEPRECATED_KEYS:
+                self._data.pop(key, None)
         except (OSError, ValueError):
             # 配置损坏时使用默认值，不影响启动
             pass

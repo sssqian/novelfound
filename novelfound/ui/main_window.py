@@ -1,5 +1,25 @@
 # -*- coding: utf-8 -*-
-"""主窗口：搜索栏 + 结果/书架列表 + 详情页 + 内置阅读器。"""
+"""主窗口：书架首页 + 书籍详情 + 内置阅读器，外加搜索/目录两个浮层。
+
+P1 信息架构（见 ``docs/UI重构实施方案.md``）：
+
+```
+┌─ 应用窗口 ───────────────────────────────────────┐
+│  📖 应用名                        已启用 N 个书源  🔍 ⚙ │
+├──────────────────────────────────────────────────┤
+│  ① 书架首页 ──点击书籍──▶ ② 书籍详情 ──继续阅读──▶ ③ 阅读器 │
+│       ▲                      │                        │
+│       └────────返回──────────┴────────返回─────────────┘ │
+│  浮层：搜索面板（Ctrl+K）  目录抽屉（Ctrl+B）  轻提示        │
+└──────────────────────────────────────────────────┘
+```
+
+要点：
+* 左侧常驻栏与 ``QSplitter`` 已删除，搜索改成 Ctrl+K 浮层；
+* 书源相关的导入/订阅/探测/网络找书源集中在「设置 → 书源」，
+  搜索 0 结果时在搜索面板内给一个快捷入口；
+* 抓取逻辑（``net`` / ``sources`` / ``cache`` / ``library`` / ``tasks``）没有改动。
+"""
 from __future__ import annotations
 
 import base64
@@ -8,24 +28,25 @@ from typing import Dict, List, Optional
 
 from PyQt5.QtCore import QByteArray, Qt, QTimer
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-                             QPushButton, QScrollArea, QShortcut, QSplitter,
-                             QStackedWidget, QToolButton, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
+                             QShortcut, QStackedWidget, QVBoxLayout, QWidget)
 
 from ..cache import Cache
 from ..config import APP_TITLE, APP_VERSION, AppConfig
 from ..library import Library
-from ..models import Book, BookDetail, ChapterContent, SearchOutcome
+from ..models import Book, BookDetail, ChapterContent
 from ..net import HttpSession
 from ..sources import BaseSource, SourceStats, build_sources
-from ..tasks import (ChapterTask, CoverTask, DetailTask, SearchTask, SubscriptionTask,
+from ..tasks import (ChapterTask, CoverTask, DetailTask, SubscriptionTask,
                      TaskManager)
-from .book_card import BookCard
-from .detail_panel import DetailPanel
+from .book_view import BookView
+from .catalog_drawer import CatalogDrawer
+from .library_view import LibraryView
 from .reader import ReaderView
+from .search_palette import SearchPalette
 from .settings_dialog import SettingsDialog
 from .source_discover_dialog import SourceDiscoverDialog
-from .widgets import Banner, EmptyState
+from .widgets import Scrim, Toast
 
 
 class MainWindow(QMainWindow):
@@ -47,18 +68,16 @@ class MainWindow(QMainWindow):
         self.current_book: Optional[Book] = None
         self.current_detail: Optional[BookDetail] = None
         self.current_source: Optional[BaseSource] = None
-        self._cards: List[BookCard] = []
-        self._shelf_cards: List[BookCard] = []
+        self._continue_index: Optional[int] = None   # 打开详情后要自动续读的章节
         self._cover_cache: Dict[str, bytes] = {}
-        self._cover_pending: List[tuple] = []      # [(url, apply, widget)]
+        self._cover_pending: List[tuple] = []        # [(url, apply, widget)]
         self._cover_active = 0
         self._cover_timer = QTimer(self)
         self._cover_timer.setSingleShot(True)
         self._cover_timer.setInterval(150)
         self._cover_timer.timeout.connect(self._pump_cover_queue)
-        self._pending_restore: Optional[int] = None
+        self._pending_position: Optional[dict] = None
         self._loading_chapter = False
-        self._sidebar_restore = False
 
         self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
         self.resize(1280, 820)
@@ -68,14 +87,7 @@ class MainWindow(QMainWindow):
         self._bind_shortcuts()
         self._restore_geometry()
         self._refresh_source_status()
-
-        last = self.config.get("last_search")
-        if last:
-            self.search_box.setText(last)
-
-        # 应用上次的侧栏状态（可能是收起的）
-        if not self.config.get("sidebar_visible", True):
-            self._set_sidebar_visible(False)
+        self._refresh_library()
 
         # 启动后延迟检查订阅更新（不阻塞界面）
         QTimer.singleShot(1200, self._maybe_update_subscriptions)
@@ -90,185 +102,96 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         # ------------------------------------------------------------ 顶部栏
+        # 方案：首页不放搜索框，搜索入口只有右上角图标 + Ctrl+K
         top = QFrame(central)
         top.setObjectName("topBar")
         top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(16, 10, 16, 10)
-        top_layout.setSpacing(10)
+        top_layout.setContentsMargins(20, 10, 16, 10)
+        top_layout.setSpacing(8)
 
         logo = QLabel("📖 小说搜索阅读器", top)
-        logo.setStyleSheet("font-size: 15px; font-weight: 700;")
+        logo.setObjectName("appTitle")
         top_layout.addWidget(logo)
-
-        self.search_box = QLineEdit(top)
-        self.search_box.setObjectName("searchBox")
-        self.search_box.setPlaceholderText("输入小说名称后按回车，例如：斗罗大陆")
-        self.search_box.setClearButtonEnabled(True)
-        self.search_box.returnPressed.connect(self.on_search)
-        top_layout.addWidget(self.search_box, 1)
-
-        self.search_button = QPushButton("搜索", top)
-        self.search_button.setObjectName("primary")
-        self.search_button.clicked.connect(self.on_search)
-        top_layout.addWidget(self.search_button)
+        top_layout.addStretch(1)
 
         self.source_label = QLabel("", top)
         self.source_label.setObjectName("muted")
         top_layout.addWidget(self.source_label)
 
-        # 侧栏收放（阅读时尤其有用）
-        self.sidebar_button = QPushButton("☰ 侧栏", top)
-        self.sidebar_button.setCheckable(True)
-        self.sidebar_button.setChecked(bool(self.config.get("sidebar_visible", True)))
-        self.sidebar_button.setToolTip("显示 / 隐藏左侧栏（Ctrl+B）")
-        self.sidebar_button.toggled.connect(self._on_sidebar_toggled)
-        top_layout.addWidget(self.sidebar_button)
+        self.search_button = QPushButton("🔍", top)
+        self.search_button.setObjectName("iconButton")
+        self.search_button.setToolTip("搜索小说（Ctrl+K）")
+        self.search_button.clicked.connect(self.open_search_palette)
+        top_layout.addWidget(self.search_button)
 
-        settings_button = QPushButton("设置", top)
-        settings_button.clicked.connect(self.open_settings)
-        top_layout.addWidget(settings_button)
+        self.settings_button = QPushButton("⚙", top)
+        self.settings_button.setObjectName("iconButton")
+        self.settings_button.setToolTip("设置（书源 / 网络 / 外观）")
+        self.settings_button.clicked.connect(self.open_settings)
+        top_layout.addWidget(self.settings_button)
 
         root.addWidget(top)
 
-        # ------------------------------------------------------------ 提示条
-        self.banner = Banner(central)
-        root.addWidget(self.banner)
+        # ------------------------------------------------------------ 页面栈
+        self.stack = QStackedWidget(central)
 
-        # ------------------------------------------------------------ 主体
-        splitter = QSplitter(Qt.Horizontal, central)
-        splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(1)
-        root.addWidget(splitter, 1)
+        self.library_view = LibraryView(self.config, self.stack)
+        self.library_view.book_opened.connect(self.on_book_clicked)
+        self.library_view.continue_requested.connect(self.on_continue_requested)
+        self.library_view.search_requested.connect(self.open_search_palette)
+        self.stack.addWidget(self.library_view)
 
-        self.side_panel = self._build_side_panel(splitter)
-        splitter.addWidget(self.side_panel)
-
-        self.stack = QStackedWidget(splitter)
-        self.welcome = EmptyState(
-            "开始搜索你的下一本小说",
-            "在顶部输入书名后回车。搜索会同时查询所有已启用的书源，\n"
-            "点击结果卡片即可查看简介与完整目录，并直接在应用内阅读。")
-        self.stack.addWidget(self.welcome)
-
-        self.detail_panel = DetailPanel(self.stack)
-        self.detail_panel.read_requested.connect(self.on_read_requested)
-        self.detail_panel.shelf_toggled.connect(self.on_shelf_toggled)
-        self.detail_panel.refresh_requested.connect(self.on_refresh_detail)
-        self.detail_panel.back_requested.connect(lambda: self.stack.setCurrentWidget(self.welcome))
-        self.stack.addWidget(self.detail_panel)
+        self.book_view = BookView(self.stack)
+        self.book_view.read_requested.connect(self.on_read_requested)
+        self.book_view.shelf_toggled.connect(self.on_shelf_toggled)
+        self.book_view.refresh_requested.connect(self.on_refresh_detail)
+        self.book_view.back_requested.connect(self.on_book_back)
+        self.book_view.catalog_requested.connect(self.open_catalog_drawer)
+        self.stack.addWidget(self.book_view)
 
         self.reader = ReaderView(self.config, self.stack)
         self.reader.chapter_requested.connect(self.load_chapter)
         self.reader.back_requested.connect(self.on_reader_back)
+        self.reader.catalog_requested.connect(self.open_catalog_drawer)
         self.reader.position_changed.connect(self.on_position_changed)
         self.stack.addWidget(self.reader)
 
-        splitter.addWidget(self.stack)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        sizes = self.config.get("splitter_sizes") or []
-        splitter.setSizes(sizes if len(sizes) == 2 else [380, 900])
-        self.splitter = splitter
+        root.addWidget(self.stack, 1)
+
+        # ------------------------------------------------------------ 浮层
+        # 遮罩、搜索面板、目录抽屉、轻提示都是中央控件的子控件（不参与布局）
+        self.scrim = Scrim(central)
+        self.scrim.clicked.connect(self._on_scrim_clicked)
+
+        self.search_palette = SearchPalette(self.config, self.http, self.task_manager,
+                                            self.stats, self._load_cover, central)
+        self.search_palette.book_chosen.connect(self.on_book_clicked)
+        self.search_palette.closed.connect(self._on_palette_closed)
+        self.search_palette.discover_requested.connect(self.open_discover_dialog)
+        self.search_palette.search_finished.connect(
+            lambda *_: self._auto_disable_failing_sources())
+
+        self.catalog_drawer = CatalogDrawer(central)
+        self.catalog_drawer.chapter_activated.connect(self.on_catalog_chapter)
+        self.catalog_drawer.closed.connect(self._on_drawer_closed)
+
+        self.toast = Toast(central)
+        self.toast.set_duration(float(self.config.get("toast_seconds") or 6))
+        self.toast.shown.connect(self._position_toast)
 
         self.statusBar().showMessage("就绪")
-        self.stack.setCurrentWidget(self.welcome)
-
-    def _build_side_panel(self, parent: QWidget) -> QWidget:
-        panel = QFrame(parent)
-        panel.setObjectName("sidePanel")
-        panel.setMinimumWidth(300)
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-
-        header = QFrame(panel)
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(10, 8, 10, 4)
-        header_layout.setSpacing(6)
-
-        self.results_tab = QToolButton(header)
-        self.results_tab.setText("搜索结果")
-        self.results_tab.setCheckable(True)
-        self.results_tab.setChecked(True)
-        self.results_tab.clicked.connect(lambda: self._switch_side(0))
-        header_layout.addWidget(self.results_tab)
-
-        self.shelf_tab = QToolButton(header)
-        self.shelf_tab.setText("我的书架")
-        self.shelf_tab.setCheckable(True)
-        self.shelf_tab.clicked.connect(lambda: self._switch_side(1))
-        header_layout.addWidget(self.shelf_tab)
-        header_layout.addStretch(1)
-
-        self.side_hint = QLabel("", header)
-        self.side_hint.setObjectName("muted")
-        header_layout.addWidget(self.side_hint)
-        layout.addWidget(header)
-
-        self.side_stack = QStackedWidget(panel)
-
-        # 搜索结果页
-        self.results_scroll = QScrollArea(panel)
-        self.results_scroll.setWidgetResizable(True)
-        self.results_container = QWidget(self.results_scroll)
-        self.results_layout = QVBoxLayout(self.results_container)
-        self.results_layout.setContentsMargins(10, 4, 10, 12)
-        self.results_layout.setSpacing(8)
-        self.results_layout.addStretch(1)
-        self.results_scroll.setWidget(self.results_container)
-        # 滚动时补下载"刚滚到可见区域"的封面
-        self.results_scroll.verticalScrollBar().valueChanged.connect(
-            lambda *_: self._cover_timer.start())
-        self.side_stack.addWidget(self.results_scroll)
-
-        # 书架页
-        self.shelf_scroll = QScrollArea(panel)
-        self.shelf_scroll.setWidgetResizable(True)
-        self.shelf_container = QWidget(self.shelf_scroll)
-        self.shelf_layout = QVBoxLayout(self.shelf_container)
-        self.shelf_layout.setContentsMargins(10, 4, 10, 12)
-        self.shelf_layout.setSpacing(8)
-        self.shelf_layout.addStretch(1)
-        self.shelf_scroll.setWidget(self.shelf_container)
-        self.shelf_scroll.verticalScrollBar().valueChanged.connect(
-            lambda *_: self._cover_timer.start())
-        self.side_stack.addWidget(self.shelf_scroll)
-
-        layout.addWidget(self.side_stack, 1)
-        self._refresh_shelf()
-        return panel
+        self.stack.setCurrentWidget(self.library_view)
+        self._layout_overlays()
 
     def _bind_shortcuts(self) -> None:
-        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.search_box.setFocus)
-        QShortcut(QKeySequence("Ctrl+L"), self, activated=self.search_box.setFocus)
-        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.on_search)
+        QShortcut(QKeySequence("Ctrl+K"), self, activated=self.open_search_palette)
+        QShortcut(QKeySequence("Ctrl+F"), self, activated=self.open_search_palette)
+        QShortcut(QKeySequence("Ctrl+B"), self, activated=self.toggle_catalog_drawer)
         QShortcut(QKeySequence("F5"), self, activated=self._reload_current_chapter)
-        QShortcut(QKeySequence("Ctrl+B"), self,
-                  activated=lambda: self.sidebar_button.toggle())
         QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.reader.change_font_size(1))
         QShortcut(QKeySequence("Ctrl++"), self, activated=lambda: self.reader.change_font_size(1))
         QShortcut(QKeySequence("Ctrl+-"), self, activated=lambda: self.reader.change_font_size(-1))
         QShortcut(QKeySequence("F11"), self, activated=self._toggle_fullscreen)
-
-    # ---------------------------------------------------------------- 侧栏
-    def _on_sidebar_toggled(self, visible: bool) -> None:
-        """用户手动切换侧栏（记到配置里）。"""
-        self._sidebar_restore = False      # 手动操作后不再自动恢复
-        self._set_sidebar_visible(visible, persist=True)
-
-    def _set_sidebar_visible(self, visible: bool, persist: bool = False) -> None:
-        """显示/隐藏左侧栏；重新显示时恢复原来的宽度。"""
-        self.side_panel.setVisible(visible)
-        if self.sidebar_button.isChecked() != visible:
-            self.sidebar_button.blockSignals(True)
-            self.sidebar_button.setChecked(visible)
-            self.sidebar_button.blockSignals(False)
-        if visible:
-            sizes = self.config.get("splitter_sizes") or [380, 900]
-            if len(sizes) == 2 and sizes[0] > 0:
-                QTimer.singleShot(0, lambda: self.splitter.setSizes(sizes))
-        if persist:
-            self.config.set("sidebar_visible", visible)
 
     def _toggle_fullscreen(self) -> None:
         if self.isFullScreen():
@@ -276,102 +199,161 @@ class MainWindow(QMainWindow):
         else:
             self.showFullScreen()
 
-    # ------------------------------------------------------------------ 搜索
-    def on_search(self) -> None:
-        keyword = self.search_box.text().strip()
+    # -------------------------------------------------------------- 浮层定位
+    def _layout_overlays(self) -> None:
+        """把遮罩 / 搜索面板 / 目录抽屉 / 轻提示摆到中央控件的对应位置。"""
+        central = self.centralWidget()
+        if central is None:
+            return
+        width = max(1, central.width())
+        height = max(1, central.height())
+
+        self.scrim.setGeometry(0, 0, width, height)
+
+        palette_width = min(660, max(420, width - 80))
+        palette_height = min(520, max(260, height - 200))
+        self.search_palette.setGeometry((width - palette_width) // 2,
+                                        max(48, height // 7),
+                                        palette_width, palette_height)
+
+        drawer_width = min(340, max(260, width // 3))
+        self.catalog_drawer.setGeometry(0, 0, drawer_width, height)
+
+        self._position_toast()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._layout_overlays()
+
+    def _position_toast(self) -> None:
+        """把 Toast 摆到底部居中（它是浮层，不参与布局）。"""
+        central = self.centralWidget()
+        if central is None or not self.toast.isVisible():
+            return
+        self.toast.reposition(central.width(), central.height())
+        self.toast.raise_()
+
+    # ------------------------------------------------------------ 浮层开合
+    def open_search_palette(self, keyword: str = "") -> None:
+        """打开搜索浮层（Ctrl+K / 点右上角 🔍）。"""
         if not keyword:
-            self.banner.show_message("请先输入要搜索的小说名称。")
-            self.search_box.setFocus()
-            return
-        self.config.set("last_search", keyword)
-        self.sources = build_sources(self.config, self.http)
-        if not self.sources:
-            self.banner.show_message(
-                "当前没有启用任何书源。请打开「设置 → 书源」勾选至少一个书源。", "error")
-            return
+            keyword = self.search_palette.keyword() or self.config.get("last_search") or ""
+        self.catalog_drawer.close_drawer()
+        self.scrim.show()
+        self.scrim.raise_()
+        self.search_palette.open(keyword)
+        self.search_palette.raise_()
+        self._layout_overlays()
+        self._cover_timer.start()
 
-        self._clear_results()
-        self.banner.hide_banner()
-        self.search_button.setEnabled(False)
-        self.search_button.setText("搜索中…")
-        self._switch_side(0)
-        self.side_hint.setText(f"搜索：{keyword}")
-        self.statusBar().showMessage(f"正在 {len(self.sources)} 个书源上搜索「{keyword}」…")
+    def close_search_palette(self) -> None:
+        self.search_palette.close_palette()
 
-        task = SearchTask(self.http, self.sources, keyword,
-                          limit=int(self.config.get("search_limit")), stats=self.stats)
-        task.signals.progress.connect(self._on_progress)
-        task.signals.partial.connect(self._on_search_partial)
-        task.signals.finished.connect(self._on_search_finished)
-        task.signals.failed.connect(self._on_task_failed)
-        self.task_manager.start(task)
+    def _on_palette_closed(self) -> None:
+        if not self.catalog_drawer.is_open():
+            self.scrim.hide()
 
-    def _on_search_partial(self, outcome: SearchOutcome) -> None:
-        if outcome.error:
-            self.banner.show_message(
-                f"书源「{outcome.source_name}」搜索失败：{outcome.error}", "error")
+    def open_catalog_drawer(self) -> None:
+        """打开目录抽屉（Ctrl+B / 详情页与阅读器的「目录」按钮）。"""
+        detail = self.current_detail
+        if detail is None or not detail.chapters:
+            self.toast.show_message("还没有目录：先打开一本书的详情。")
             return
-        if not outcome.books:
-            return
-        for book in outcome.books:
-            self._add_result_card(book)
+        index = (self.reader.chapter_index
+                 if self.stack.currentWidget() is self.reader
+                 else self.book_view.reading_index())
+        self.search_palette.close_palette()
+        self.scrim.show()
+        self.scrim.raise_()
+        self.catalog_drawer.open_drawer(detail, index)
+        self.catalog_drawer.raise_()
+        self._layout_overlays()
 
-    def _on_search_finished(self, outcomes: List[SearchOutcome]) -> None:
-        self.search_button.setEnabled(True)
-        self.search_button.setText("搜索")
-        total = sum(len(o.books) for o in outcomes)
-        failed = [o for o in outcomes if o.error]
-        if total == 0:
-            self.banner.show_message(
-                "没有找到匹配的小说。可以换一个关键词，或让程序去网络上找一个新书源。",
-                action_text="网络找书源", action=self.open_discover_dialog)
-            self.statusBar().showMessage("搜索完成，没有结果")
+    def close_catalog_drawer(self) -> None:
+        self.catalog_drawer.close_drawer()
+
+    def toggle_catalog_drawer(self) -> None:
+        if self.catalog_drawer.is_open():
+            self.close_catalog_drawer()
         else:
-            self.statusBar().showMessage(
-                f"搜索完成：共 {total} 条结果"
-                + (f"，{len(failed)} 个书源失败" if failed else ""))
-        self.side_hint.setText(f"共 {total} 条")
-        self._auto_disable_failing_sources()
+            self.open_catalog_drawer()
 
-    def _add_result_card(self, book: Book) -> None:
-        if len(self._cards) >= 150:
+    def _on_drawer_closed(self) -> None:
+        if not self.search_palette.is_open():
+            self.scrim.hide()
+
+    def _on_scrim_clicked(self) -> None:
+        """点遮罩：关掉当前打开的浮层。"""
+        if self.search_palette.is_open():
+            self.search_palette.close_palette()
+        if self.catalog_drawer.is_open():
+            self.catalog_drawer.close_drawer()
+
+    def _close_overlays(self) -> None:
+        self.search_palette.close_palette()
+        self.catalog_drawer.close_drawer()
+        self.scrim.hide()
+
+    def on_catalog_chapter(self, index: int) -> None:
+        """目录抽屉里点了某一章：直接跳过去读。"""
+        self.close_catalog_drawer()
+        if self.current_detail is None:
             return
-        card = BookCard(book, self.results_container)
-        card.clicked.connect(self.on_card_clicked)
-        self.results_layout.insertWidget(self.results_layout.count() - 1, card)
-        self._cards.append(card)
-        if self.config.get("auto_load_cover") and book.cover_url:
-            self._load_cover(book.cover_url, card.cover.set_image, card.cover)
+        if self.stack.currentWidget() is not self.reader:
+            self.on_read_requested(self.current_detail, index)
+        else:
+            self.load_chapter(index)
 
-    def _clear_results(self) -> None:
-        for card in self._cards:
-            card.setParent(None)
-            card.deleteLater()
-        self._cards.clear()
-        self._cover_pending.clear()
-        self.side_hint.setText("")
+    # ------------------------------------------------------------------ 页面
+    def show_library(self) -> None:
+        """回到书架首页（顺便刷新进度与封面）。"""
+        self._refresh_library()
+        self.stack.setCurrentWidget(self.library_view)
+        self._cover_timer.start()
+
+    def on_book_back(self) -> None:
+        self.show_library()
+
+    def on_reader_back(self) -> None:
+        if self.current_detail is not None:
+            self.book_view.set_reading_progress(self.reader.chapter_index)
+            self.stack.setCurrentWidget(self.book_view)
+        else:
+            self.show_library()
+
+    def _refresh_library(self) -> None:
+        self.library_view.refresh(self.library, self._load_cover)
 
     # ------------------------------------------------------------------ 详情
-    def on_card_clicked(self, book: Book) -> None:
-        for card in self._cards:
-            card.set_selected(card.book.key == book.key)
-        for card in self._shelf_cards:
-            card.set_selected(card.book.key == book.key)
+    def on_book_clicked(self, book: Book) -> None:
+        """打开一本书的详情（搜索面板 / 书架首页都会走这里）。"""
+        self._open_book(book)
+
+    def on_continue_requested(self, book: Book) -> None:
+        """「继续阅读」：打开详情后直接跳到上次读到的章节。"""
+        progress = self.library.progress(book.key)
+        index = int(progress.get("index", 0) or 0) if progress.get("chapter_url") else 0
+        self._open_book(book, continue_index=index)
+
+    def _open_book(self, book: Book, continue_index: Optional[int] = None) -> None:
         source = self._source_for(book)
         if source is None:
-            self.banner.show_message(
+            self.toast.show_message(
                 f"该书源（{book.source_name or book.source}）已被禁用，"
                 "请在「设置 → 书源」中重新启用。", "error")
             return
+        self._close_overlays()
         self.current_book = book
         self.current_source = source
-        self.banner.hide_banner()
+        self._continue_index = continue_index
         self.statusBar().showMessage(f"正在获取《{book.title}》的目录…")
-        self.stack.setCurrentWidget(self.detail_panel)
-        self.detail_panel.title_label.setText(book.title)
-        self.detail_panel.meta_label.setText("正在加载目录…")
-        self.detail_panel.intro_label.setText("")
-        self.detail_panel.catalog.clear()
+        self.stack.setCurrentWidget(self.book_view)
+        self.book_view.title_label.setText(book.title)
+        self.book_view.meta_label.setText("正在加载目录…")
+        self.book_view.progress_label.setText("")
+        self.book_view.intro_label.setText("")
+        self.book_view.source_label.setText(
+            f"来源：{book.source_name}" if book.source_name else "")
 
         task = DetailTask(source, book, self.cache, stats=self.stats)
         task.signals.progress.connect(self._on_progress)
@@ -385,21 +367,27 @@ class MainWindow(QMainWindow):
         self.current_book = book
         self.current_source = self._source_for(book) or self.current_source
         cached = self.cache.has_chapter(book.source, book.url)
-        self.detail_panel.set_detail(detail, in_shelf=self.library.contains(book.key),
-                                     cached_count=cached,
-                                     progress=self.library.progress(book.key))
+        self.book_view.set_detail(detail, in_shelf=self.library.contains(book.key),
+                                  cached_count=cached,
+                                  progress=self.library.progress(book.key))
         if self.config.get("auto_load_cover") and book.cover_url:
-            self._load_cover(book.cover_url, self.detail_panel.set_cover,
-                             self.detail_panel.cover)
+            self._load_cover(book.cover_url, self.book_view.set_cover,
+                             self.book_view.cover)
         self.statusBar().showMessage(f"《{book.title}》共 {len(detail.chapters)} 章")
+        # 「继续阅读」：目录就绪后直接进入上次读到的章节
+        if self._continue_index is not None:
+            index, self._continue_index = self._continue_index, None
+            if 0 <= index < len(detail.chapters):
+                self.on_read_requested(detail, index)
 
     def _on_detail_failed(self, message: str, detail: str) -> None:
+        self._continue_index = None
         self.statusBar().showMessage("目录获取失败")
-        self.banner.show_message(f"目录获取失败：{message}", "error")
-        self.detail_panel.meta_label.setText(f"加载失败：{message}")
-        self.detail_panel.intro_label.setText(
+        self.toast.show_message(f"目录获取失败：{message}", "error")
+        self.book_view.meta_label.setText(f"加载失败：{message}")
+        self.book_view.intro_label.setText(
             "可能原因：站点结构变化、网络不通、或该书源需要人机验证。\n"
-            "建议：点击「返回搜索结果」换一个书源，或在设置中检测书源可用性。")
+            "建议：换一个书源，或在设置中检测书源可用性。")
 
     def on_refresh_detail(self, book: Book) -> None:
         source = self._source_for(book)
@@ -413,16 +401,18 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ 阅读
     def on_read_requested(self, detail: BookDetail, index: int) -> None:
+        self._close_overlays()
         self.current_detail = detail
         self.current_book = detail.book
         self.current_source = self._source_for(detail.book) or self.current_source
         self.reader.set_book(len(detail.chapters), index)
         self.reader.apply_settings()
-        # 阅读时自动收起左侧栏（读完返回目录时会自动恢复）
-        if self.config.get("auto_hide_sidebar", True) and self.side_panel.isVisible():
-            self._sidebar_restore = True
-            self._set_sidebar_visible(False)
         self.stack.setCurrentWidget(self.reader)
+        # 上下控制条：默认自动隐藏，靠近边缘才出现
+        if not self.config.get("auto_hide_bars", True):
+            self.reader.show_bars()
+        else:
+            self.reader.hide_bars()
         self.library.mark_read(detail.book)
         self.load_chapter(index)
 
@@ -439,10 +429,15 @@ class MainWindow(QMainWindow):
         self.reader.set_loading(chapter.display_title)
         self.statusBar().showMessage(f"正在加载：{chapter.display_title}")
         progress = self.library.progress(self.current_detail.book.key)
-        restore = self.reader.position_for(chapter.url)
-        if not restore and progress.get("index") == index:
-            restore = progress.get("scroll_pos") or 0
-        self._pending_restore = restore
+        position = self.reader.position_for(chapter.url)
+        if not position and progress.get("index") == index:
+            position = {
+                "scroll_pos": progress.get("scroll_pos", 0),
+                "block_index": progress.get("block_index", -1),
+                "page_index": progress.get("page_index", -1),
+                "char_offset": progress.get("char_offset", -1),
+            }
+        self._pending_position = position
 
         task = ChapterTask(self.current_source, self.current_detail.book, chapter,
                            self.cache, stats=self.stats)
@@ -453,21 +448,23 @@ class MainWindow(QMainWindow):
 
     def _on_chapter_ready(self, content: ChapterContent, index: int) -> None:
         self._loading_chapter = False
-        restore = self._pending_restore or 0
-        self._pending_restore = None
-        self.reader.set_content(content, index=index, restore_pos=restore)
-        self.detail_panel.set_reading_progress(index)
+        position = self._pending_position
+        self._pending_position = None
+        self.reader.set_content(content, index=index, position=position)
+        self.book_view.set_reading_progress(index)
+        if self.catalog_drawer.is_open():
+            self.catalog_drawer.set_current(index)
         book = self.current_detail.book
-        self.library.update_progress(book, content.url, content.title, index, restore)
+        self.library.update_progress(book, content.url, content.title, index,
+                                     **self.reader.reading_position())
         self.statusBar().showMessage(
             f"《{book.title}》 · 第 {index + 1} 章 / 共 {self.reader.chapter_count} 章"
             + ("（缓存）" if content.from_cache else ""))
-        self._refresh_shelf_card_progress(book.key, index)
 
     def _on_chapter_failed(self, message: str, detail: str, index: int) -> None:
         self._loading_chapter = False
         self.reader.set_error(message)
-        self.banner.show_message(f"章节加载失败：{message}", "error")
+        self.toast.show_message(f"章节加载失败：{message}", "error")
         self.statusBar().showMessage("章节加载失败")
 
     def _reload_current_chapter(self) -> None:
@@ -486,17 +483,7 @@ class MainWindow(QMainWindow):
         task.signals.failed.connect(lambda msg, d: self._on_chapter_failed(msg, d, index))
         self.task_manager.start(task)
 
-    def on_reader_back(self) -> None:
-        if self.current_detail is not None:
-            self.stack.setCurrentWidget(self.detail_panel)
-        else:
-            self.stack.setCurrentWidget(self.welcome)
-        # 恢复进入阅读器前被自动收起的侧栏
-        if getattr(self, "_sidebar_restore", False):
-            self._sidebar_restore = False
-            self._set_sidebar_visible(True)
-
-    def on_position_changed(self, index: int, scroll_pos: int) -> None:
+    def on_position_changed(self, index: int, position: dict) -> None:
         if self.current_detail is None:
             return
         chapters = self.current_detail.chapters
@@ -504,87 +491,14 @@ class MainWindow(QMainWindow):
             return
         chapter = chapters[index]
         self.library.update_progress(self.current_detail.book, chapter.url,
-                                     chapter.title, index, scroll_pos)
+                                     chapter.title, index, **(position or {}))
 
     # ------------------------------------------------------------------ 书架
     def on_shelf_toggled(self, book: Book) -> None:
         added = self.library.toggle(book, self.current_detail)
-        self.detail_panel.shelf_button.setText("移出书架" if added else "加入书架")
-        self._refresh_shelf()
+        self.book_view.shelf_button.setText("★ 已在书架" if added else "☆ 加入书架")
+        self._refresh_library()
         self.statusBar().showMessage("已加入书架" if added else "已移出书架")
-
-    def _refresh_shelf(self) -> None:
-        for card in self._shelf_cards:
-            card.setParent(None)
-            card.deleteLater()
-        self._shelf_cards.clear()
-        while self.shelf_layout.count() > 1:
-            item = self.shelf_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-
-        books = self.library.books()
-        if not books:
-            empty = QLabel("书架还是空的。\n搜索到喜欢的小说后，在详情页点击「加入书架」。",
-                           self.shelf_container)
-            empty.setObjectName("muted")
-            empty.setWordWrap(True)
-            empty.setAlignment(Qt.AlignCenter)
-            empty.setContentsMargins(12, 24, 12, 12)
-            self.shelf_layout.insertWidget(0, empty)
-            self.shelf_tab.setText("我的书架")
-        else:
-            for record in books:
-                self._add_shelf_card(record, self.shelf_layout.count() - 1)
-            self.shelf_tab.setText(f"我的书架({len(books)})")
-
-        # 最近阅读（含未加入书架的书），方便继续上次的进度
-        shelf_keys = {r.get("key") for r in books}
-        history = [h for h in self.library.history() if h.get("key") not in shelf_keys][:10]
-        if history:
-            title = QLabel("最近阅读", self.shelf_container)
-            title.setObjectName("sideHeader")
-            self.shelf_layout.insertWidget(self.shelf_layout.count() - 1, title)
-            for record in history:
-                self._add_shelf_card(record, self.shelf_layout.count() - 1)
-
-    def _add_shelf_card(self, record: Dict, position: int) -> None:
-        """把一条书架/历史记录渲染成卡片。"""
-        book = Book(
-            title=record.get("title", ""), author=record.get("author", ""),
-            url=record.get("url", ""), cover_url=record.get("cover_url", ""),
-            intro=record.get("intro", ""), source=record.get("source", ""),
-            source_name=record.get("source_name", ""),
-            category=record.get("category", ""), status=record.get("status", ""),
-            latest_chapter=record.get("latest_chapter", ""))
-        card = BookCard(book, self.shelf_container)
-        if record.get("last_chapter_title"):
-            card.meta_label.setText(
-                f"{card.meta_label.text()}　·　读到：{record['last_chapter_title']}")
-        card.clicked.connect(self.on_card_clicked)
-        self.shelf_layout.insertWidget(position, card)
-        self._shelf_cards.append(card)
-        if self.config.get("auto_load_cover") and book.cover_url:
-            self._load_cover(book.cover_url, card.cover.set_image, card.cover)
-
-    def _refresh_shelf_card_progress(self, key: str, index: int) -> None:
-        record = self.library.get(key)
-        if record is None:
-            return
-        for card in self._shelf_cards:
-            if card.book.key == key and record.get("last_chapter_title"):
-                base = card.meta_label.text().split("　·　读到：")[0]
-                card.meta_label.setText(
-                    f"{base}　·　读到：{record['last_chapter_title']}")
-
-    def _switch_side(self, index: int) -> None:
-        self.side_stack.setCurrentIndex(index)
-        self.results_tab.setChecked(index == 0)
-        self.shelf_tab.setChecked(index == 1)
-        if index == 1:
-            self._refresh_shelf()
 
     # ------------------------------------------------------------------ 封面
     def _load_cover(self, url: str, apply, widget=None) -> None:
@@ -708,7 +622,7 @@ class MainWindow(QMainWindow):
             return
         self.sources = build_sources(self.config, self.http)
         self._refresh_source_status()
-        self.banner.show_message(
+        self.toast.show_message(
             "以下书源连续失败已自动禁用：" + "、".join(names)
             + "。可在「设置 → 书源」里重新勾选，或点「重置评分」后重试。")
 
@@ -743,19 +657,13 @@ class MainWindow(QMainWindow):
         self.sources = build_sources(self.config, self.http)
         self._refresh_source_status()
         if rules:
-            self.banner.show_message(f"已从订阅更新 {len(rules)} 个书源。")
+            self.toast.show_message(f"已从订阅更新 {len(rules)} 个书源。")
         elif failures:
-            self.banner.show_message("书源订阅更新失败：" + "；".join(failures[:2]), "error")
+            self.toast.show_message("书源订阅更新失败：" + "；".join(failures[:2]), "error")
         self.statusBar().showMessage("就绪")
 
     def _on_progress(self, text: str) -> None:
         self.statusBar().showMessage(text)
-
-    def _on_task_failed(self, message: str, detail: str) -> None:
-        self.search_button.setEnabled(True)
-        self.search_button.setText("搜索")
-        self.banner.show_message(message, "error")
-        self.statusBar().showMessage("操作失败")
 
     def _refresh_source_status(self) -> None:
         enabled = build_sources(self.config, self.http)
@@ -776,7 +684,8 @@ class MainWindow(QMainWindow):
 
     def open_discover_dialog(self) -> None:
         """打开「网络找书源」对话框（方案 C）。"""
-        keyword = self.search_box.text().strip() or self.config.get("last_search") or ""
+        keyword = (self.search_palette.keyword()
+                   or self.config.get("last_search") or "")
         dialog = SourceDiscoverDialog(self.config, self.http, self.task_manager,
                                       book_title=keyword, parent=self)
         dialog.sources_changed.connect(self._on_discovered_sources)
@@ -786,11 +695,12 @@ class MainWindow(QMainWindow):
         """发现并保存了新书源后：刷新书源列表，并用同一个关键词重搜一次。"""
         self.sources = build_sources(self.config, self.http)
         self._refresh_source_status()
-        self.banner.hide_banner()
-        keyword = self.search_box.text().strip() or self.config.get("last_search") or ""
+        self.toast.hide_banner()
+        keyword = (self.search_palette.keyword()
+                   or self.config.get("last_search") or "")
         if keyword:
             self.statusBar().showMessage("已添加新书源，正在重新搜索…")
-            self.on_search()
+            self.open_search_palette(keyword)
 
     def _on_settings_sources_changed(self) -> None:
         self.sources = build_sources(self.config, self.http)
@@ -824,7 +734,6 @@ class MainWindow(QMainWindow):
             self.config.set("window_state",
                             base64.b64encode(bytes(self.saveState())).decode("ascii"),
                             autosave=False)
-            self.config.set("splitter_sizes", self.splitter.sizes(), autosave=False)
             self.config.save()
         except Exception:
             pass

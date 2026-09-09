@@ -110,6 +110,14 @@ class SettingsDialog(QDialog):
         self.first_indent.setToolTip("中文小说习惯首行缩进 2 字符；设为 0 则顶格排版")
         form.addRow("首行缩进", self.first_indent)
 
+        self.content_width = QSpinBox(page)
+        self.content_width.setRange(600, 1200)
+        self.content_width.setSingleStep(20)
+        self.content_width.setSuffix(" px")
+        self.content_width.setValue(int(self.config.get("content_width") or 820))
+        self.content_width.setToolTip("正文最大宽度；一行太长会影响阅读，建议 700–900")
+        form.addRow("正文宽度", self.content_width)
+
         self.theme_box = QComboBox(page)
         for key, theme in READER_THEMES.items():
             self.theme_box.addItem(theme["name"], key)
@@ -124,6 +132,14 @@ class SettingsDialog(QDialog):
         self.mode_box.setCurrentIndex(index if index >= 0 else 0)
         form.addRow("翻页方式", self.mode_box)
 
+        self.columns_box = QComboBox(page)
+        self.columns_box.addItem("单页", 1)
+        self.columns_box.addItem("左右双页", 2)
+        col_index = self.columns_box.findData(int(self.config.get("page_columns") or 1))
+        self.columns_box.setCurrentIndex(col_index if col_index >= 0 else 0)
+        self.columns_box.setToolTip("翻页模式下的排版；选「左右双页」会自动切到翻页模式")
+        form.addRow("排版", self.columns_box)
+
         self.strict_filter = QCheckBox("严格广告过滤（会丢弃含外链、推广词的整行）", page)
         self.strict_filter.setChecked(bool(self.config.get("strict_ad_filter")))
         form.addRow("", self.strict_filter)
@@ -131,10 +147,6 @@ class SettingsDialog(QDialog):
         self.auto_cover = QCheckBox("自动加载封面图片", page)
         self.auto_cover.setChecked(bool(self.config.get("auto_load_cover")))
         form.addRow("", self.auto_cover)
-
-        self.auto_hide_sidebar = QCheckBox("阅读时自动隐藏左侧栏（Ctrl+B 手动切换）", page)
-        self.auto_hide_sidebar.setChecked(bool(self.config.get("auto_hide_sidebar", True)))
-        form.addRow("", self.auto_hide_sidebar)
         return page
 
     # ------------------------------------------------------------ 网络与缓存
@@ -413,11 +425,12 @@ class SettingsDialog(QDialog):
             "line_height": round(self.line_height.value(), 2),
             "paragraph_spacing": self.para_spacing.value(),
             "first_line_indent": self.first_indent.value(),
+            "content_width": self.content_width.value(),
             "reader_theme": self.theme_box.currentData(),
             "reader_mode": self.mode_box.currentData(),
+            "page_columns": int(self.columns_box.currentData() or 1),
             "strict_ad_filter": self.strict_filter.isChecked(),
             "auto_load_cover": self.auto_cover.isChecked(),
-            "auto_hide_sidebar": self.auto_hide_sidebar.isChecked(),
             "timeout": self.timeout.value(),
             "retries": self.retries.value(),
             "search_limit": self.limit.value(),
