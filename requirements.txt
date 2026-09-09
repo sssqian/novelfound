@@ -1,0 +1,23 @@
+# NovelFound 依赖清单
+#
+# 安装：
+#     pip install -r requirements.txt
+#
+# 说明：
+#   PyQt5        桌面界面（GUI 框架）
+#   requests     HTTP 请求（会话、超时、重试）
+#   beautifulsoup4 + lxml   HTML 解析（lxml 更快更容错，缺失时自动回退 html.parser）
+#
+# 打包（可选，生成单文件可执行程序）：
+#     pip install pyinstaller
+#     pyinstaller build/novelfound.spec
+
+PyQt5>=5.15.0
+PyQt5-Qt5>=5.15.2
+PyQt5-sip>=12.11
+requests>=2.28.0
+beautifulsoup4>=4.11.0
+lxml>=4.9.0
+
+# 仅打包时需要
+# pyinstaller>=6.0

@@ -1,0 +1,77 @@
+[
+  {
+    "bookSourceName": "和图书（Legado 示例）",
+    "bookSourceUrl": "https://www.hetushu.com",
+    "bookSourceGroup": "示例",
+    "bookSourceType": 0,
+    "enabled": true,
+    "searchUrl": "/search/?keyword={{key}}",
+    "ruleSearch": {
+      "bookList": "@css:dl#body dd",
+      "name": "@css:h4 a@text",
+      "author": "@css:h4 span@text",
+      "bookUrl": "@css:h4 a@href",
+      "coverUrl": "@css:img@src",
+      "intro": "@css:div.intro@text"
+    },
+    "ruleBookInfo": {
+      "name": "@css:.book_info h2@text",
+      "author": "@css:.book_info div@text",
+      "intro": "@css:.book_info .intro@text",
+      "coverUrl": "@css:.book_info img@src",
+      "kind": "@css:.book_info div@text"
+    },
+    "ruleToc": {
+      "chapterList": "@css:dl#dir dd a",
+      "chapterName": "@css:text"
+    },
+    "ruleContent": {
+      "content": "@css:#content"
+    }
+  },
+  {
+    "bookSourceName": "蚂蚁文学（Legado 示例）",
+    "bookSourceUrl": "https://www.mayiwsk.com",
+    "bookSourceGroup": "示例",
+    "bookSourceType": 0,
+    "enabled": true,
+    "searchUrl": "/modules/article/search.php?searchkey={{key}}",
+    "ruleSearch": {
+      "bookList": "@css:table.grid tr",
+      "name": "@css:td:nth-of-type(1) a@text",
+      "author": "@css:td:nth-of-type(3)@text",
+      "bookUrl": "@css:td:nth-of-type(1) a@href",
+      "lastChapter": "@css:td:nth-of-type(2) a@text"
+    },
+    "ruleBookInfo": {
+      "name": "@css:#info h1@text",
+      "author": "@css:#info p@text",
+      "intro": "@css:#intro@text",
+      "coverUrl": "@css:#fmimg img@src"
+    },
+    "ruleToc": {
+      "chapterList": "@css:#list dl dd a",
+      "chapterName": "@css:text"
+    },
+    "ruleContent": {
+      "content": "@css:#content"
+    }
+  },
+  {
+    "bookSourceName": "含 JS 规则的书源（导入时会被跳过）",
+    "bookSourceUrl": "https://example.com",
+    "enabled": true,
+    "searchUrl": "/search?q={{key}}",
+    "ruleSearch": {
+      "bookList": "@css:div.result",
+      "name": "<js>result.name.replace(/\\s+/g, '')</js>",
+      "bookUrl": "@css:a@href"
+    },
+    "ruleToc": {
+      "chapterList": "@css:ul.list a"
+    },
+    "ruleContent": {
+      "content": "@css:#content"
+    }
+  }
+]
