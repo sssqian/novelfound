@@ -20,7 +20,6 @@ from ..tasks import HealthTask, TaskManager
 from .source_discover_dialog import SourceDiscoverDialog
 from .source_import_dialog import SourceImportDialog
 from .source_probe_dialog import SourceProbeDialog
-from .theme import READER_THEMES
 
 CUSTOM_TEMPLATE = """{
   "key": "my_source",
@@ -59,7 +58,7 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget(self)
-        tabs.addTab(self._build_reader_tab(), "阅读")
+        tabs.addTab(self._build_appearance_tab(), "外观与其它")
         tabs.addTab(self._build_network_tab(), "网络与缓存")
         tabs.addTab(self._build_source_tab(), "书源")
         layout.addWidget(tabs, 1)
@@ -71,82 +70,36 @@ class SettingsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
-    # ---------------------------------------------------------------- 阅读页
-    def _build_reader_tab(self) -> QWidget:
+    # ---------------------------------------------------------- 外观与其它
+    def _build_appearance_tab(self) -> QWidget:
+        """P2 起阅读相关项都搬到了阅读器的 `Aa` 浮层，这里只留全局项。
+
+        以前设置里也有一份字号/主题/排版，和阅读器里的控件形成"两处真相"，
+        容易出现"设置里改了但阅读器没生效"的困惑——现在只剩一份。
+        """
         page = QWidget(self)
-        form = QFormLayout(page)
+        layout = QVBoxLayout(page)
 
-        self.font_size = QSpinBox(page)
-        self.font_size.setRange(12, 48)
-        self.font_size.setValue(int(self.config.get("font_size")))
-        form.addRow("正文字号", self.font_size)
+        note = QLabel(
+            "阅读相关的字号 / 字体 / 行距 / 段距 / 首行缩进 / 正文宽度 /\n"
+            "背景主题 / 翻页方式 / 单双页，请在阅读器里点右上角「Aa」调整，\n"
+            "改完即时生效。", page)
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
 
-        self.font_family = QComboBox(page)
-        self.font_family.setEditable(True)
-        self.font_family.addItem("跟随系统默认", "")
-        for name in ("Microsoft YaHei", "微软雅黑", "宋体", "楷体", "思源宋体",
-                     "PingFang SC", "Noto Serif CJK SC"):
-            self.font_family.addItem(name, name)
-        current = self.config.get("font_family") or ""
-        index = self.font_family.findData(current)
-        self.font_family.setCurrentIndex(index if index >= 0 else 0)
-        form.addRow("正文字体", self.font_family)
+        box = QGroupBox("其它", page)
+        form = QFormLayout(box)
 
-        self.line_height = QDoubleSpinBox(page)
-        self.line_height.setRange(1.2, 3.0)
-        self.line_height.setSingleStep(0.1)
-        self.line_height.setValue(float(self.config.get("line_height")))
-        form.addRow("行距倍数", self.line_height)
-
-        self.para_spacing = QSpinBox(page)
-        self.para_spacing.setRange(0, 40)
-        self.para_spacing.setValue(int(self.config.get("paragraph_spacing")))
-        form.addRow("段间距（像素）", self.para_spacing)
-
-        self.first_indent = QSpinBox(page)
-        self.first_indent.setRange(0, 4)
-        self.first_indent.setSuffix(" 字符")
-        self.first_indent.setValue(int(self.config.get("first_line_indent") or 0))
-        self.first_indent.setToolTip("中文小说习惯首行缩进 2 字符；设为 0 则顶格排版")
-        form.addRow("首行缩进", self.first_indent)
-
-        self.content_width = QSpinBox(page)
-        self.content_width.setRange(600, 1200)
-        self.content_width.setSingleStep(20)
-        self.content_width.setSuffix(" px")
-        self.content_width.setValue(int(self.config.get("content_width") or 820))
-        self.content_width.setToolTip("正文最大宽度；一行太长会影响阅读，建议 700–900")
-        form.addRow("正文宽度", self.content_width)
-
-        self.theme_box = QComboBox(page)
-        for key, theme in READER_THEMES.items():
-            self.theme_box.addItem(theme["name"], key)
-        index = self.theme_box.findData(self.config.get("reader_theme"))
-        self.theme_box.setCurrentIndex(index if index >= 0 else 0)
-        form.addRow("阅读背景", self.theme_box)
-
-        self.mode_box = QComboBox(page)
-        self.mode_box.addItem("滚动阅读", "scroll")
-        self.mode_box.addItem("整页翻页", "page")
-        index = self.mode_box.findData(self.config.get("reader_mode"))
-        self.mode_box.setCurrentIndex(index if index >= 0 else 0)
-        form.addRow("翻页方式", self.mode_box)
-
-        self.columns_box = QComboBox(page)
-        self.columns_box.addItem("单页", 1)
-        self.columns_box.addItem("左右双页", 2)
-        col_index = self.columns_box.findData(int(self.config.get("page_columns") or 1))
-        self.columns_box.setCurrentIndex(col_index if col_index >= 0 else 0)
-        self.columns_box.setToolTip("翻页模式下的排版；选「左右双页」会自动切到翻页模式")
-        form.addRow("排版", self.columns_box)
-
-        self.strict_filter = QCheckBox("严格广告过滤（会丢弃含外链、推广词的整行）", page)
+        self.strict_filter = QCheckBox("严格广告过滤（会丢弃含外链、推广词的整行）", box)
         self.strict_filter.setChecked(bool(self.config.get("strict_ad_filter")))
         form.addRow("", self.strict_filter)
 
-        self.auto_cover = QCheckBox("自动加载封面图片", page)
+        self.auto_cover = QCheckBox("自动加载封面图片", box)
         self.auto_cover.setChecked(bool(self.config.get("auto_load_cover")))
         form.addRow("", self.auto_cover)
+        layout.addWidget(box)
+        layout.addStretch(1)
         return page
 
     # ------------------------------------------------------------ 网络与缓存
@@ -420,15 +373,6 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ 保存
     def _on_accept(self) -> None:
         self.config.update({
-            "font_size": self.font_size.value(),
-            "font_family": self.font_family.currentData() or "",
-            "line_height": round(self.line_height.value(), 2),
-            "paragraph_spacing": self.para_spacing.value(),
-            "first_line_indent": self.first_indent.value(),
-            "content_width": self.content_width.value(),
-            "reader_theme": self.theme_box.currentData(),
-            "reader_mode": self.mode_box.currentData(),
-            "page_columns": int(self.columns_box.currentData() or 1),
             "strict_ad_filter": self.strict_filter.isChecked(),
             "auto_load_cover": self.auto_cover.isChecked(),
             "timeout": self.timeout.value(),

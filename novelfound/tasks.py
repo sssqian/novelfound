@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import time
 import traceback
+from pathlib import Path
 from typing import Any, List, Optional, Sequence
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, pyqtSignal
 
 from .cache import Cache
 from .config import AppConfig
+from .localbooks import LocalBooks
 from .models import Book, BookDetail, Chapter, ChapterContent, SearchOutcome
 from .net import HttpSession, NovelError
 from .sources import BaseSource
@@ -271,7 +273,6 @@ class HealthTask(BaseTask):
 
 class ImportTask(BaseTask):
     """从 URL 或本地文本导入书源规则。"""
-
     def __init__(self, http: HttpSession, url: str = "", text: str = ""):
         super().__init__()
         self.http = http
@@ -289,6 +290,37 @@ class ImportTask(BaseTask):
         parsed = parse_payload(payload, origin)
         self.signals.progress.emit(f"解析完成：{len(parsed)} 条")
         return parsed
+
+
+class LocalImportTask(BaseTask):
+    """导入本地电子书（TXT / EPUB）：解析 + 复制进数据目录。
+
+    解析一本几 MB 的 TXT 需要一两秒，所以放到线程池里跑，界面不卡。
+    """
+
+    def __init__(self, paths: Sequence[str], books=None, title: str = "",
+                 author: str = ""):
+        super().__init__()
+        self.paths = [Path(p) for p in paths]
+        self.books = books if books is not None else LocalBooks()
+        self.title = title
+        self.author = author
+
+    def work(self) -> dict:
+        imported, failures = [], []
+        for index, path in enumerate(self.paths):
+            if self.cancelled:
+                break
+            self.signals.progress.emit(
+                f"正在导入（{index + 1}/{len(self.paths)}）：{path.name}")
+            try:
+                record = self.books.import_file(
+                    path, title=self.title, author=self.author,
+                    on_note=self.signals.progress.emit)
+                imported.append(record)
+            except Exception as exc:  # noqa: BLE001 - 单个文件失败不影响其它文件
+                failures.append(f"{path.name}：{exc}")
+        return {"imported": imported, "failures": failures}
 
 
 class ProbeTask(BaseTask):

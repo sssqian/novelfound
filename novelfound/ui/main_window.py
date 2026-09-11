@@ -28,24 +28,30 @@ from typing import Dict, List, Optional
 
 from PyQt5.QtCore import QByteArray, Qt, QTimer
 from PyQt5.QtGui import QKeySequence
-from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton,
-                             QShortcut, QStackedWidget, QVBoxLayout, QWidget)
+from PyQt5.QtWidgets import (QFileDialog, QFrame, QHBoxLayout, QLabel, QMainWindow,
+                             QPushButton, QShortcut, QStackedWidget, QVBoxLayout,
+                             QWidget)
 
 from ..cache import Cache
 from ..config import APP_TITLE, APP_VERSION, AppConfig
+from ..history import KIND_CHAPTER, KIND_DETAIL, BrowseHistory
 from ..library import Library
-from ..models import Book, BookDetail, ChapterContent
+from ..localbooks import LocalBooks
+from .. import localbooks
+from ..models import Book, BookDetail, Chapter, ChapterContent
 from ..net import HttpSession
 from ..sources import BaseSource, SourceStats, build_sources
-from ..tasks import (ChapterTask, CoverTask, DetailTask, SubscriptionTask,
-                     TaskManager)
+from ..tasks import (ChapterTask, CoverTask, DetailTask, LocalImportTask,
+                     SubscriptionTask, TaskManager)
 from .book_view import BookView
 from .catalog_drawer import CatalogDrawer
+from .history_panel import HistoryPanel
 from .library_view import LibraryView
 from .reader import ReaderView
 from .search_palette import SearchPalette
 from .settings_dialog import SettingsDialog
 from .source_discover_dialog import SourceDiscoverDialog
+from .theme import reader_theme, theme_is_dark
 from .widgets import Scrim, Toast
 
 
@@ -61,6 +67,8 @@ class MainWindow(QMainWindow):
         self.cache = Cache(enabled=bool(self.config.get("cache_enabled")),
                            ttl_days=int(self.config.get("cache_days")))
         self.library = Library()
+        self.history = BrowseHistory()
+        self.local_books = LocalBooks()
         self.stats = SourceStats()
         self.task_manager = TaskManager()
         self.sources: List[BaseSource] = build_sources(self.config, self.http)
@@ -68,7 +76,8 @@ class MainWindow(QMainWindow):
         self.current_book: Optional[Book] = None
         self.current_detail: Optional[BookDetail] = None
         self.current_source: Optional[BaseSource] = None
-        self._continue_index: Optional[int] = None   # 打开详情后要自动续读的章节
+        # 从浏览历史点进来时，目录就绪后要直接跳到的那一章
+        self._pending_chapter: Optional[int] = None
         self._cover_cache: Dict[str, bytes] = {}
         self._cover_pending: List[tuple] = []        # [(url, apply, widget)]
         self._cover_active = 0
@@ -82,11 +91,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
         self.resize(1280, 820)
         self.setMinimumSize(980, 640)
+        self.setAcceptDrops(True)          # 支持把 TXT / EPUB 拖进窗口导入
 
         self._build_ui()
         self._bind_shortcuts()
         self._restore_geometry()
         self._refresh_source_status()
+        self._refresh_history_badge()
         self._refresh_library()
 
         # 启动后延迟检查订阅更新（不阻塞界面）
@@ -105,6 +116,7 @@ class MainWindow(QMainWindow):
         # 方案：首页不放搜索框，搜索入口只有右上角图标 + Ctrl+K
         top = QFrame(central)
         top.setObjectName("topBar")
+        self.top_bar = top                      # 进阅读器时要跟着阅读主题换色
         top_layout = QHBoxLayout(top)
         top_layout.setContentsMargins(20, 10, 16, 10)
         top_layout.setSpacing(8)
@@ -117,6 +129,12 @@ class MainWindow(QMainWindow):
         self.source_label = QLabel("", top)
         self.source_label.setObjectName("muted")
         top_layout.addWidget(self.source_label)
+
+        self.history_button = QPushButton("🕘", top)
+        self.history_button.setObjectName("iconButton")
+        self.history_button.setToolTip("浏览历史（记录每一次打开详情 / 阅读章节）")
+        self.history_button.clicked.connect(self.open_history_panel)
+        top_layout.addWidget(self.history_button)
 
         self.search_button = QPushButton("🔍", top)
         self.search_button.setObjectName("iconButton")
@@ -137,8 +155,8 @@ class MainWindow(QMainWindow):
 
         self.library_view = LibraryView(self.config, self.stack)
         self.library_view.book_opened.connect(self.on_book_clicked)
-        self.library_view.continue_requested.connect(self.on_continue_requested)
         self.library_view.search_requested.connect(self.open_search_palette)
+        self.library_view.import_requested.connect(self.open_import_dialog)
         self.stack.addWidget(self.library_view)
 
         self.book_view = BookView(self.stack)
@@ -154,6 +172,8 @@ class MainWindow(QMainWindow):
         self.reader.back_requested.connect(self.on_reader_back)
         self.reader.catalog_requested.connect(self.open_catalog_drawer)
         self.reader.position_changed.connect(self.on_position_changed)
+        self.reader.settings_changed.connect(self._sync_shell_theme)
+        self.reader.theme_changed.connect(self._sync_shell_theme)
         self.stack.addWidget(self.reader)
 
         root.addWidget(self.stack, 1)
@@ -175,6 +195,11 @@ class MainWindow(QMainWindow):
         self.catalog_drawer.chapter_activated.connect(self.on_catalog_chapter)
         self.catalog_drawer.closed.connect(self._on_drawer_closed)
 
+        self.history_panel = HistoryPanel(self._load_cover, central)
+        self.history_panel.entry_chosen.connect(self.on_history_entry)
+        self.history_panel.closed.connect(self._on_history_closed)
+        self.history_panel.cleared.connect(self.on_history_cleared)
+
         self.toast = Toast(central)
         self.toast.set_duration(float(self.config.get("toast_seconds") or 6))
         self.toast.shown.connect(self._position_toast)
@@ -186,6 +211,7 @@ class MainWindow(QMainWindow):
     def _bind_shortcuts(self) -> None:
         QShortcut(QKeySequence("Ctrl+K"), self, activated=self.open_search_palette)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self.open_search_palette)
+        QShortcut(QKeySequence("Ctrl+H"), self, activated=self.open_history_panel)
         QShortcut(QKeySequence("Ctrl+B"), self, activated=self.toggle_catalog_drawer)
         QShortcut(QKeySequence("F5"), self, activated=self._reload_current_chapter)
         QShortcut(QKeySequence("Ctrl+="), self, activated=lambda: self.reader.change_font_size(1))
@@ -201,7 +227,7 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- 浮层定位
     def _layout_overlays(self) -> None:
-        """把遮罩 / 搜索面板 / 目录抽屉 / 轻提示摆到中央控件的对应位置。"""
+        """把遮罩 / 浮层 / 抽屉 / 轻提示摆到中央控件的对应位置。"""
         central = self.centralWidget()
         if central is None:
             return
@@ -212,9 +238,10 @@ class MainWindow(QMainWindow):
 
         palette_width = min(660, max(420, width - 80))
         palette_height = min(520, max(260, height - 200))
-        self.search_palette.setGeometry((width - palette_width) // 2,
-                                        max(48, height // 7),
-                                        palette_width, palette_height)
+        palette_geometry = ((width - palette_width) // 2, max(48, height // 7),
+                            palette_width, palette_height)
+        self.search_palette.setGeometry(*palette_geometry)
+        self.history_panel.setGeometry(*palette_geometry)
 
         drawer_width = min(340, max(260, width // 3))
         self.catalog_drawer.setGeometry(0, 0, drawer_width, height)
@@ -234,24 +261,31 @@ class MainWindow(QMainWindow):
         self.toast.raise_()
 
     # ------------------------------------------------------------ 浮层开合
+    def _show_scrim(self) -> None:
+        """淡入遮罩（200ms），保证它压在浮层下面。"""
+        self.scrim.show_scrim()
+
+    def _hide_scrim(self) -> None:
+        self.scrim.hide_scrim()
+
     def open_search_palette(self, keyword: str = "") -> None:
         """打开搜索浮层（Ctrl+K / 点右上角 🔍）。"""
         if not keyword:
             keyword = self.search_palette.keyword() or self.config.get("last_search") or ""
         self.catalog_drawer.close_drawer()
-        self.scrim.show()
-        self.scrim.raise_()
+        self.history_panel.close_panel()
+        self._layout_overlays()
+        self._show_scrim()
         self.search_palette.open(keyword)
         self.search_palette.raise_()
-        self._layout_overlays()
         self._cover_timer.start()
 
     def close_search_palette(self) -> None:
         self.search_palette.close_palette()
 
     def _on_palette_closed(self) -> None:
-        if not self.catalog_drawer.is_open():
-            self.scrim.hide()
+        if not (self.catalog_drawer.is_open() or self.history_panel.is_open()):
+            self._hide_scrim()
 
     def open_catalog_drawer(self) -> None:
         """打开目录抽屉（Ctrl+B / 详情页与阅读器的「目录」按钮）。"""
@@ -263,11 +297,11 @@ class MainWindow(QMainWindow):
                  if self.stack.currentWidget() is self.reader
                  else self.book_view.reading_index())
         self.search_palette.close_palette()
-        self.scrim.show()
-        self.scrim.raise_()
+        self.history_panel.close_panel()
+        self._layout_overlays()          # 先把抽屉摆到最终位置，再从左侧滑入
+        self._show_scrim()
         self.catalog_drawer.open_drawer(detail, index)
         self.catalog_drawer.raise_()
-        self._layout_overlays()
 
     def close_catalog_drawer(self) -> None:
         self.catalog_drawer.close_drawer()
@@ -279,20 +313,60 @@ class MainWindow(QMainWindow):
             self.open_catalog_drawer()
 
     def _on_drawer_closed(self) -> None:
-        if not self.search_palette.is_open():
-            self.scrim.hide()
+        if not (self.search_palette.is_open() or self.history_panel.is_open()):
+            self._hide_scrim()
+
+    # ------------------------------------------------------------ 浏览历史
+    def open_history_panel(self) -> None:
+        """打开浏览历史浮层（右上角 🕘 / Ctrl+H）。"""
+        self.catalog_drawer.close_drawer()
+        self.search_palette.close_palette()
+        self._layout_overlays()
+        self._show_scrim()
+        self.history_panel.open_panel(self.history)
+        self.history_panel.raise_()
+        self._cover_timer.start()
+
+    def close_history_panel(self) -> None:
+        self.history_panel.close_panel()
+
+    def _on_history_closed(self) -> None:
+        if not (self.search_palette.is_open() or self.catalog_drawer.is_open()):
+            self._hide_scrim()
+
+    def on_history_entry(self, entry: dict) -> None:
+        """点历史里的一条：回到当时那本书（阅读记录直接跳到那一章）。"""
+        book = self.history.book_of(entry)
+        if not book.url:
+            return
+        index = int(entry.get("chapter_index", -1))
+        jump = index if (entry.get("chapter_url") and index >= 0) else None
+        self._open_book(book, chapter_index=jump)
+
+    def on_history_cleared(self) -> None:
+        self.history.clear()
+        self._refresh_history_badge()
+        self.toast.show_message("浏览历史已清空。")
+
+    def _refresh_history_badge(self) -> None:
+        count = self.history.count()
+        self.history_button.setToolTip(
+            f"浏览历史（{count} 条）" if count else "浏览历史（暂无记录）")
 
     def _on_scrim_clicked(self) -> None:
         """点遮罩：关掉当前打开的浮层。"""
         if self.search_palette.is_open():
             self.search_palette.close_palette()
+        if self.history_panel.is_open():
+            self.history_panel.close_panel()
         if self.catalog_drawer.is_open():
             self.catalog_drawer.close_drawer()
 
     def _close_overlays(self) -> None:
         self.search_palette.close_palette()
+        self.history_panel.close_panel()
         self.catalog_drawer.close_drawer()
-        self.scrim.hide()
+        self._hide_scrim()
 
     def on_catalog_chapter(self, index: int) -> None:
         """目录抽屉里点了某一章：直接跳过去读。"""
@@ -304,22 +378,109 @@ class MainWindow(QMainWindow):
         else:
             self.load_chapter(index)
 
+    # ------------------------------------------------------------------ 本地书籍
+    def open_import_dialog(self) -> None:
+        """选文件导入本地 TXT / EPUB（也可以把文件直接拖进窗口）。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "导入本地电子书（可多选）", "",
+            "电子书 (*.txt *.epub);;文本文件 (*.txt);;EPUB 电子书 (*.epub);;所有文件 (*)")
+        if paths:
+            self.import_local_books(paths)
+
+    def import_local_books(self, paths) -> None:
+        """把一批本地文件导入书架（解析在工作线程里做）。"""
+        files = [str(p) for p in paths if str(p).lower().endswith((".txt", ".epub"))]
+        skipped = len(list(paths)) - len(files)
+        if not files:
+            self.toast.show_message("只支持 .txt 和 .epub 文件。")
+            return
+        self.toast.show_message(f"正在导入 {len(files)} 个文件…")
+        task = LocalImportTask(files, self.local_books)
+        task.signals.progress.connect(self._on_progress)
+        task.signals.finished.connect(self._on_local_imported)
+        task.signals.failed.connect(
+            lambda msg, detail: self.toast.show_message(f"导入失败：{msg}", "error"))
+        self.task_manager.start(task)
+        if skipped:
+            self.statusBar().showMessage(f"已跳过 {skipped} 个不支持的文件")
+
+    def _on_local_imported(self, result) -> None:
+        """导入完成：加入书架 + 刷新首页（这样就能直接点进去读）。"""
+        imported = list((result or {}).get("imported") or [])
+        failures = list((result or {}).get("failures") or [])
+        for record in imported:
+            book = self.local_books.to_book(record)
+            count = len(record.get("chapters") or [])
+            detail = BookDetail(book=book,
+                                chapters=[Chapter(index=i) for i in range(count)])
+            self.library.add(book, detail)      # 记下章节数，书架格子才有百分比
+            self.statusBar().showMessage(
+                f"已导入《{book.title}》：{count} 章")
+        self.sources = build_sources(self.config, self.http)
+        self._refresh_source_status()
+        self._refresh_library()
+        self.show_library()
+        if imported:
+            self.toast.show_message(f"已导入 {len(imported)} 本，点封面即可阅读。")
+        if failures:
+            self.toast.show_message("部分文件导入失败：" + "；".join(failures[:2]), "error")
+
+    def dragEnterEvent(self, event) -> None:  # noqa: N802
+        """允许把 TXT / EPUB 拖进窗口导入。"""
+        if self._drop_paths(event):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:  # noqa: N802
+        paths = self._drop_paths(event)
+        if paths:
+            event.acceptProposedAction()
+            self.import_local_books(paths)
+
+    @staticmethod
+    def _drop_paths(event) -> list:
+        if not event.mimeData().hasUrls():
+            return []
+        return [u.toLocalFile() for u in event.mimeData().urls()
+                if u.isLocalFile() and u.toLocalFile().lower().endswith((".txt", ".epub"))]
+
     # ------------------------------------------------------------------ 页面
+    def _sync_shell_theme(self) -> None:
+        """进入阅读器时**收起顶部应用栏**，并让状态栏跟随阅读主题。
+
+        阅读器自己的顶部浮条（鼠标靠近才出现）已经提供了「返回 / 书名 / 目录 / Aa」，
+        再留一条「📖 小说搜索阅读器」横栏既占地方，夜间模式下还会和深色正文打架。
+        所以：阅读时隐藏顶部栏，状态栏按当前阅读主题着色；离开阅读器时全部还原。
+        """
+        in_reader = self.stack.currentWidget() is self.reader
+        self.top_bar.setVisible(not in_reader)
+        if in_reader:
+            theme = reader_theme(self.reader._theme_key)
+            line = ("rgba(255,255,255,0.14)" if theme_is_dark(theme)
+                    else "rgba(0,0,0,0.08)")
+            self.statusBar().setStyleSheet(
+                f"QStatusBar {{ background: {theme['bg']}; color: {theme['muted']}; "
+                f"border-top: 1px solid {line}; }}")
+        else:
+            self.statusBar().setStyleSheet("")      # 空样式表 → 回到 app 级暖白 QSS
+
     def show_library(self) -> None:
         """回到书架首页（顺便刷新进度与封面）。"""
         self._refresh_library()
         self.stack.setCurrentWidget(self.library_view)
+        self._sync_shell_theme()
         self._cover_timer.start()
 
     def on_book_back(self) -> None:
         self.show_library()
 
     def on_reader_back(self) -> None:
+        self._record_reading_history()      # 结束阅读这本书 → 写一条（一本书只留一条）
         if self.current_detail is not None:
             self.book_view.set_reading_progress(self.reader.chapter_index)
             self.stack.setCurrentWidget(self.book_view)
         else:
-            self.show_library()
+            self.stack.setCurrentWidget(self.library_view)
+        self._sync_shell_theme()
 
     def _refresh_library(self) -> None:
         self.library_view.refresh(self.library, self._load_cover)
@@ -329,13 +490,7 @@ class MainWindow(QMainWindow):
         """打开一本书的详情（搜索面板 / 书架首页都会走这里）。"""
         self._open_book(book)
 
-    def on_continue_requested(self, book: Book) -> None:
-        """「继续阅读」：打开详情后直接跳到上次读到的章节。"""
-        progress = self.library.progress(book.key)
-        index = int(progress.get("index", 0) or 0) if progress.get("chapter_url") else 0
-        self._open_book(book, continue_index=index)
-
-    def _open_book(self, book: Book, continue_index: Optional[int] = None) -> None:
+    def _open_book(self, book: Book, chapter_index: Optional[int] = None) -> None:
         source = self._source_for(book)
         if source is None:
             self.toast.show_message(
@@ -345,7 +500,7 @@ class MainWindow(QMainWindow):
         self._close_overlays()
         self.current_book = book
         self.current_source = source
-        self._continue_index = continue_index
+        self._pending_chapter = chapter_index
         self.statusBar().showMessage(f"正在获取《{book.title}》的目录…")
         self.stack.setCurrentWidget(self.book_view)
         self.book_view.title_label.setText(book.title)
@@ -374,14 +529,16 @@ class MainWindow(QMainWindow):
             self._load_cover(book.cover_url, self.book_view.set_cover,
                              self.book_view.cover)
         self.statusBar().showMessage(f"《{book.title}》共 {len(detail.chapters)} 章")
-        # 「继续阅读」：目录就绪后直接进入上次读到的章节
-        if self._continue_index is not None:
-            index, self._continue_index = self._continue_index, None
+        # 浏览历史：详情加载成功才算"浏览过"
+        self._record_history(book, KIND_DETAIL)
+        # 从浏览历史点进来时，直接回到当时读的那一章
+        if self._pending_chapter is not None:
+            index, self._pending_chapter = self._pending_chapter, None
             if 0 <= index < len(detail.chapters):
                 self.on_read_requested(detail, index)
 
     def _on_detail_failed(self, message: str, detail: str) -> None:
-        self._continue_index = None
+        self._pending_chapter = None
         self.statusBar().showMessage("目录获取失败")
         self.toast.show_message(f"目录获取失败：{message}", "error")
         self.book_view.meta_label.setText(f"加载失败：{message}")
@@ -408,6 +565,7 @@ class MainWindow(QMainWindow):
         self.reader.set_book(len(detail.chapters), index)
         self.reader.apply_settings()
         self.stack.setCurrentWidget(self.reader)
+        self._sync_shell_theme()          # 顶栏/状态栏跟随阅读主题
         # 上下控制条：默认自动隐藏，靠近边缘才出现
         if not self.config.get("auto_hide_bars", True):
             self.reader.show_bars()
@@ -455,6 +613,8 @@ class MainWindow(QMainWindow):
         if self.catalog_drawer.is_open():
             self.catalog_drawer.set_current(index)
         book = self.current_detail.book
+        # 浏览历史不在这里写：切章太频繁，会在历史里堆出同一本书的很多条。
+        # 改为离开阅读器 / 关闭应用时各写一次（见 _record_reading_history）。
         self.library.update_progress(book, content.url, content.title, index,
                                      **self.reader.reading_position())
         self.statusBar().showMessage(
@@ -500,6 +660,31 @@ class MainWindow(QMainWindow):
         self._refresh_library()
         self.statusBar().showMessage("已加入书架" if added else "已移出书架")
 
+    # ------------------------------------------------------------ 浏览历史
+    def _record_history(self, book: Book, kind: str, index: int = -1,
+                        chapter=None) -> None:
+        """写入/刷新这本书的历史记录（**一本书只留一条**）。"""
+        self.history.record(
+            book, kind=kind,
+            chapter_index=index if chapter is not None else -1,
+            chapter_title=getattr(chapter, "title", "") if chapter is not None else "",
+            chapter_url=getattr(chapter, "url", "") if chapter is not None else "")
+        self._refresh_history_badge()
+
+    def _record_reading_history(self) -> None:
+        """离开阅读器（或关闭应用）时，把"这本书读到哪"写进历史。
+
+        只在**结束阅读**时写一次：既不随每次切章刷记录，也不会让历史里
+        同一本书出现多条。进度本身仍由 `library.update_progress()` 实时保存。
+        """
+        if self.current_detail is None:
+            return
+        index = self.reader.chapter_index
+        chapters = self.current_detail.chapters
+        chapter = chapters[index] if 0 <= index < len(chapters) else None
+        self._record_history(self.current_detail.book, KIND_CHAPTER,
+                             index=index, chapter=chapter)
+
     # ------------------------------------------------------------------ 封面
     def _load_cover(self, url: str, apply, widget=None) -> None:
         """登记一次封面加载。
@@ -510,6 +695,13 @@ class MainWindow(QMainWindow):
         卡片滚到可见区域时才真正发起请求。
         """
         if not url:
+            return
+        if url.startswith(localbooks.COVER_PREFIX):
+            # 本地 EPUB 封面：直接读文件，不走网络队列
+            item = self.local_books.get(url[len(localbooks.COVER_PREFIX):])
+            data = self.local_books.cover_bytes(item) if item else b""
+            if data:
+                self._apply_cover(apply, data)
             return
         cached = self._cover_cache.get(url)
         if cached:
@@ -725,6 +917,12 @@ class MainWindow(QMainWindow):
         # 保存当前阅读位置，避免刚翻页就关闭导致进度丢失
         try:
             self.reader._emit_position()
+        except Exception:
+            pass
+        # 直接关应用时也要把"这本书读到哪"写进浏览历史（一本书只留一条）
+        try:
+            if self.stack.currentWidget() is self.reader:
+                self._record_reading_history()
         except Exception:
             pass
         try:

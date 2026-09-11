@@ -43,6 +43,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("NOVELFOUND_HOME", str(ROOT / "tests" / ".smoke"))
 
+# 离屏平台默认不加载字体 → 界面上的文字全都画不出来（截图里只有色块和图片）。
+# 必须在 QApplication 创建之前指定系统字体目录，Qt 的 basic font database 才会扫描。
+if not os.environ.get("QT_QPA_FONTDIR"):
+    for _candidate in (Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+                       Path("/System/Library/Fonts"),
+                       Path("/usr/share/fonts")):
+        if _candidate.is_dir():
+            os.environ["QT_QPA_FONTDIR"] = str(_candidate)
+            break
+
 
 # --------------------------------------------------------------------------- 应用
 def make_app(clean: bool = True):

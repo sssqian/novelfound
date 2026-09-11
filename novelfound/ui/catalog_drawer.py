@@ -17,10 +17,11 @@ from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget
                              QListWidgetItem, QPushButton, QVBoxLayout, QWidget)
 
 from ..models import BookDetail, Chapter
+from .widgets import DRAWER_MS, slide_in, slide_out
 
 
 class CatalogDrawer(QFrame):
-    """目录抽屉。"""
+    """目录抽屉（250ms 从左侧滑出）。"""
 
     chapter_activated = pyqtSignal(int)      # 章节序号
     closed = pyqtSignal()
@@ -31,6 +32,7 @@ class CatalogDrawer(QFrame):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.detail: Optional[BookDetail] = None
         self._current = -1
+        self._shown_state = False          # 真实开合状态（动画只负责视觉）
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -77,23 +79,30 @@ class CatalogDrawer(QFrame):
 
     # ------------------------------------------------------------------ 开关
     def open_drawer(self, detail: BookDetail, current_index: int = -1) -> None:
-        """填充并显示抽屉（当前章高亮）。"""
+        """填充并从左侧滑出（当前章高亮）。"""
         self.detail = detail
         self.title_label.setText(f"目录（{len(detail.chapters)} 章）")
         self.filter_box.clear()
         self._fill(detail.chapters, current_index)
+        self._shown_state = True
         self.show()
         self.raise_()
+        # 从"屏幕左外侧"滑到最终位置（最终 x 由主窗口 setGeometry 决定，固定为 0）
+        end_x = self.x()
+        slide_in(self, end_x - max(80, self.width()), end_x, DRAWER_MS)
         self.filter_box.setFocus()
 
     def close_drawer(self) -> None:
-        if not self.isVisible():
-            return
-        self.hide()
-        self.closed.emit()
+        """滑出后隐藏；状态立即置为关闭。"""
+        was_open = self._shown_state
+        self._shown_state = False
+        if self.isVisible():
+            slide_out(self, self.x() - max(80, self.width()), DRAWER_MS)
+        if was_open:
+            self.closed.emit()
 
     def is_open(self) -> bool:
-        return self.isVisible()
+        return self._shown_state
 
     def set_current(self, index: int) -> None:
         """高亮当前阅读章节（切章时调用）。"""

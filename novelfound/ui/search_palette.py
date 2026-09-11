@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (QFrame, QHBoxLayout, QLabel, QLineEdit, QListWidget
 from ..models import Book, SearchOutcome
 from ..sources import build_sources
 from ..tasks import SearchTask
-from .widgets import CoverLabel
+from .widgets import FADE_MS, CoverLabel, fade
 
 
 class SearchResultRow(QFrame):
@@ -92,6 +92,7 @@ class SearchPalette(QFrame):
         self._queued_keyword = ""
         self._last_keyword = ""
         self._seq = 0
+        self._shown_state = False          # 真实开合状态（动画只负责视觉）
 
         self.setObjectName("paletteCard")
         self.setAttribute(Qt.WA_StyledBackground, True)
@@ -158,10 +159,11 @@ class SearchPalette(QFrame):
 
     # ------------------------------------------------------------------ 开关
     def open(self, keyword: str = "") -> None:  # noqa: A003 - 与 Qt 习惯一致
-        """显示面板；带新关键词时直接搜一次（同一关键词不重复搜）。"""
+        """淡入显示面板；带新关键词时直接搜一次（同一关键词不重复搜）。"""
         if keyword and keyword != self.input.text():
             self.input.setText(keyword)
-        self.show()
+        self._shown_state = True
+        fade(self, True, FADE_MS)          # 200ms 淡入
         self.raise_()
         self.input.setFocus()
         self.input.selectAll()
@@ -171,12 +173,17 @@ class SearchPalette(QFrame):
             self._run_search()
 
     def close_palette(self) -> None:
+        """淡出隐藏；状态立即置为关闭（不依赖动画跑完）。"""
         self._debounce.stop()
-        self.hide()
-        self.closed.emit()
+        was_open = self._shown_state
+        self._shown_state = False
+        if self.isVisible():
+            fade(self, False, FADE_MS)
+        if was_open or self.isVisible():
+            self.closed.emit()
 
     def is_open(self) -> bool:
-        return self.isVisible()
+        return self._shown_state
 
     def keyword(self) -> str:
         return self.input.text().strip()

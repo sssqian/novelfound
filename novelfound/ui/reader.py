@@ -20,7 +20,8 @@ from PyQt5.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QSizePolicy
 
 from ..config import AppConfig
 from ..models import ChapterContent
-from .theme import READER_THEMES, reader_theme, theme_is_dark
+from .reader_settings import ReaderSettingsPopover
+from .theme import READER_THEMES, reader_selection, reader_theme, theme_is_dark
 from .widgets import AutoHideBar, ProgressLine
 
 
@@ -31,6 +32,7 @@ class ReaderView(QWidget):
     back_requested = pyqtSignal()              # 返回详情
     catalog_requested = pyqtSignal()           # 打开目录抽屉（Ctrl+B）
     settings_changed = pyqtSignal()            # 字号/主题变化，需要写回配置
+    theme_changed = pyqtSignal()               # 阅读背景主题变了（主窗口顶栏/状态栏要跟着换色）
     position_changed = pyqtSignal(int, object)  # (chapter_index, 进度字典)
 
     def __init__(self, config: AppConfig, parent: Optional[QWidget] = None):
@@ -140,38 +142,19 @@ class ReaderView(QWidget):
         bar.addWidget(self.title_label)
         bar.addStretch(1)
 
-        self.font_down = QToolButton(self.top_bar)
-        self.font_down.setText("A−")
-        self.font_down.setToolTip("减小字号（Ctrl+-）")
-        self.font_down.clicked.connect(lambda: self.change_font_size(-1))
-        bar.addWidget(self.font_down)
+        self.catalog_button = QToolButton(self.top_bar)
+        self.catalog_button.setText("目录")
+        self.catalog_button.setToolTip("打开目录抽屉（Ctrl+B）")
+        self.catalog_button.clicked.connect(self.catalog_requested.emit)
+        bar.addWidget(self.catalog_button)
 
-        self.font_up = QToolButton(self.top_bar)
-        self.font_up.setText("A+")
-        self.font_up.setToolTip("增大字号（Ctrl+=）")
-        self.font_up.clicked.connect(lambda: self.change_font_size(1))
-        bar.addWidget(self.font_up)
-
-        self.theme_box = QComboBox(self.top_bar)
-        for key, theme in READER_THEMES.items():
-            self.theme_box.addItem(theme["name"], key)
-        self.theme_box.setToolTip("阅读背景色")
-        self.theme_box.currentIndexChanged.connect(self._on_theme_changed)
-        bar.addWidget(self.theme_box)
-
-        self.mode_button = QToolButton(self.top_bar)
-        self.mode_button.setCheckable(True)
-        self.mode_button.setText("翻页模式")
-        self.mode_button.setToolTip("切换 滚动 / 整页翻页（PageUp、PageDown、空格）")
-        self.mode_button.toggled.connect(self._on_mode_toggled)
-        bar.addWidget(self.mode_button)
-
-        self.columns_box = QComboBox(self.top_bar)
-        self.columns_box.addItem("单页", 1)
-        self.columns_box.addItem("左右双页", 2)
-        self.columns_box.setToolTip("翻页模式下的排版：单页 / 左右双页（选双页会自动切到翻页模式）")
-        self.columns_box.currentIndexChanged.connect(self._on_columns_changed)
-        bar.addWidget(self.columns_box)
+        # 阅读设置（字号/字体/行距/段距/页宽/缩进/主题/翻页方式）收进 Aa 浮层，
+        # 沉浸阅读时顶部只剩「返回 · 书名 · 目录 · Aa · 全屏」，安静很多。
+        self.settings_button = QToolButton(self.top_bar)
+        self.settings_button.setText("Aa")
+        self.settings_button.setToolTip("阅读设置（字号 / 主题 / 排版）")
+        self.settings_button.clicked.connect(self.toggle_settings_popover)
+        bar.addWidget(self.settings_button)
 
         self.fullscreen_button = QToolButton(self.top_bar)
         self.fullscreen_button.setText("全屏")
@@ -210,6 +193,11 @@ class ReaderView(QWidget):
         # ------------------------------------------------------------ 进度细线
         self.progress_line = ProgressLine(self.canvas)
 
+        # 阅读设置浮层（Aa）：改完即时生效
+        self.settings_popover = ReaderSettingsPopover(self.config, self.canvas)
+        self.settings_popover.changed.connect(self._on_settings_changed)
+        self.settings_popover.closed.connect(self._on_settings_closed)
+
         # 兼容旧名字（原来叫 toolbar）
         self.toolbar = self.top_bar
         self.body = self.canvas
@@ -220,8 +208,36 @@ class ReaderView(QWidget):
         self._layout_overlays()
 
     # ------------------------------------------------------------------ 设置
+    def _on_fullscreen_toggled(self, checked: bool) -> None:
+        """顶部浮条上的「全屏」按钮（和设置浮层里那个同步）。"""
+        window = self.window()
+        if window is None:
+            return
+        if checked:
+            window.showFullScreen()
+        else:
+            window.showNormal()
+
+    def toggle_settings_popover(self) -> None:
+        """点 Aa：开/关阅读设置浮层。"""
+        if self.settings_popover.isVisible():
+            self.settings_popover.close_popover()
+        else:
+            self.settings_popover.open_popover()
+            self._layout_overlays()
+
+    def _on_settings_changed(self) -> None:
+        """浮层里改了任何设置：应用 + 重绘 + 通知主窗口写配置。"""
+        self.apply_settings()
+        self.render()
+        self.settings_changed.emit()
+
+    def _on_settings_closed(self) -> None:
+        self.settings_button.setChecked(False)
+
     def apply_settings(self) -> None:
         """把配置应用到阅读器（字号、字体、行距、主题、模式、正文宽度）。"""
+        previous_theme = getattr(self, "_applied_theme", None)
         self._font_size = int(self.config.get("font_size"))
         self._font_family = self.config.get("font_family") or ""
         self._line_height = float(self.config.get("line_height"))
@@ -233,8 +249,12 @@ class ReaderView(QWidget):
         self._content_width = max(480, int(self.config.get("content_width") or 820))
 
         theme = reader_theme(self._theme_key)
+        # 选中高亮也跟着主题走，避免用 Qt 默认的系统蓝
+        sel_bg, sel_fg = reader_selection(theme)
         view_css = (f"QTextBrowser {{ background: {theme['bg']}; border: none; "
-                    f"color: {theme['fg']}; }}")
+                    f"color: {theme['fg']}; "
+                    f"selection-background-color: {sel_bg}; "
+                    f"selection-color: {sel_fg}; }}")
         self.view.setStyleSheet(view_css)
         self.view2.setStyleSheet(view_css)
         # 用 documentMargin 控制内边距（而不是 CSS padding），
@@ -259,25 +279,15 @@ class ReaderView(QWidget):
                 f"#autoHideBar QLabel {{ color: {theme['muted']}; }}")
         self.progress_line.set_colors(line, theme["fg"])
 
-        index = self.theme_box.findData(self._theme_key)
-        if index >= 0 and index != self.theme_box.currentIndex():
-            self.theme_box.blockSignals(True)
-            self.theme_box.setCurrentIndex(index)
-            self.theme_box.blockSignals(False)
-        col_index = self.columns_box.findData(2 if self._two_page else 1)
-        if col_index >= 0 and col_index != self.columns_box.currentIndex():
-            self.columns_box.blockSignals(True)
-            self.columns_box.setCurrentIndex(col_index)
-            self.columns_box.blockSignals(False)
-        if self.mode_button.isChecked() != self._page_mode:
-            self.mode_button.blockSignals(True)
-            self.mode_button.setChecked(self._page_mode)
-            self.mode_button.setText("滚动模式" if self._page_mode else "翻页模式")
-            self.mode_button.blockSignals(False)
+        # 字号/主题/排版控件都收进了 Aa 浮层，这里只负责同步浮层显示
         self.view.setVerticalScrollBarPolicy(
             Qt.ScrollBarAlwaysOff if self._page_mode else Qt.ScrollBarAsNeeded)
+        self.settings_popover.sync_from_config()
+        self._applied_theme = self._theme_key
+        if previous_theme is not None and previous_theme != self._theme_key:
+            # 通知主窗口：顶栏/状态栏的底色要跟着换，否则夜间模式会出现"浅色外壳"
+            self.theme_changed.emit()
 
-    # -------------------------------------------------------------- 浮条布局
     def _column_widths(self) -> tuple:
         """返回 (每栏宽度, 是否双页)。
 
@@ -312,7 +322,7 @@ class ReaderView(QWidget):
                 Qt.ScrollBarAsNeeded if too_tall else Qt.ScrollBarAlwaysOff)
 
     def _layout_overlays(self) -> None:
-        """把上下浮条与进度线贴到画布边缘（它们不参与布局）。"""
+        """把上下浮条、进度线、阅读设置浮层贴到画布边缘（它们都不参与布局）。"""
         width = max(1, self.canvas.width())
         height = max(1, self.canvas.height())
         top_h = max(38, self.top_bar.sizeHint().height())
@@ -321,6 +331,15 @@ class ReaderView(QWidget):
         self.bottom_bar.setGeometry(0, height - bottom_h - 2, width, bottom_h)
         self.progress_line.setGeometry(0, height - 2, width, 2)
         self.progress_line.raise_()
+
+        # 阅读设置浮层：挂在右上角（Aa 按钮下方）
+        popover = self.settings_popover
+        popover.adjustSize()
+        pop_h = min(popover.sizeHint().height(), max(200, height - top_h - 24))
+        popover.setGeometry(max(8, width - popover.width() - 12),
+                            top_h + 6, popover.width(), pop_h)
+        if popover.isVisible():
+            popover.raise_()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -374,6 +393,11 @@ class ReaderView(QWidget):
         elif event.type() == QEvent.Leave:
             self.top_bar.maybe_auto_hide()
             self.bottom_bar.maybe_auto_hide()
+        elif event.type() == QEvent.MouseButtonPress and \
+                self.settings_popover.isVisible():
+            # 点正文/画布任意处即收起设置浮层（浮层自己的点击事件传不到这里，
+            # 所以点浮层内部不会误关）。Esc 也能关。
+            self.settings_popover.close_popover()
         elif view is not None and event.type() == QEvent.Wheel and self._page_mode:
             # 翻页模式下，滚轮在正文上也应该整屏翻页；
             # 只有"某段比整页还高、需要页内滚动"时才让视图自己滚。
@@ -390,52 +414,15 @@ class ReaderView(QWidget):
         return super().eventFilter(obj, event)
 
     def change_font_size(self, delta: int) -> None:
+        """快捷键 / 浮层按钮改字号（Ctrl+= / Ctrl+-）。"""
         size = max(12, min(48, int(self.config.get("font_size")) + delta))
         if size == int(self.config.get("font_size")):
             return
         self.config.set("font_size", size)
         self.apply_settings()
+        self.settings_popover.set_font_size(size)
         self.render()
         self.settings_changed.emit()
-
-    def _on_theme_changed(self) -> None:
-        key = self.theme_box.currentData()
-        if not key or key == self.config.get("reader_theme"):
-            return
-        self.config.set("reader_theme", key)
-        self.apply_settings()
-        self.render()          # 文字颜色写在字符格式里，换肤后必须重绘
-        self.settings_changed.emit()
-
-    def _on_mode_toggled(self, checked: bool) -> None:
-        self._page_mode = checked
-        self.mode_button.setText("滚动模式" if checked else "翻页模式")
-        self.config.set("reader_mode", "page" if checked else "scroll")
-        self.apply_settings()
-        self.render()              # 翻页模式要分页，滚动模式要整章渲染
-        self.settings_changed.emit()
-
-    def _on_columns_changed(self) -> None:
-        """切换单页 / 左右双页；选双页时自动切到翻页模式。"""
-        columns = int(self.columns_box.currentData() or 1)
-        if columns == int(self.config.get("page_columns") or 1) and \
-                not (columns == 2 and not self._page_mode):
-            return
-        self.config.set("page_columns", columns)
-        if columns == 2 and not self._page_mode:
-            # 双页只在翻页模式下有意义，自动切过去
-            self.mode_button.setChecked(True)
-            return                    # setChecked 会触发 _on_mode_toggled
-        self.apply_settings()
-        self.render()
-        self.settings_changed.emit()
-
-    def _on_fullscreen_toggled(self, checked: bool) -> None:
-        window = self.window()
-        if checked:
-            window.showFullScreen()
-        else:
-            window.showNormal()
 
     # ------------------------------------------------------------------ 内容
     def set_book(self, chapter_count: int, chapter_index: int = 0) -> None:
@@ -1001,6 +988,9 @@ class ReaderView(QWidget):
             bar = self.view.verticalScrollBar()
             bar.setValue(bar.maximum())
         elif key == Qt.Key_Escape:
+            if self.settings_popover.isVisible():
+                self.settings_popover.close_popover()      # 先收设置浮层
+                return
             if self.fullscreen_button.isChecked():
                 self.fullscreen_button.setChecked(False)
             else:

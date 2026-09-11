@@ -27,6 +27,18 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("NOVELFOUND_HOME", str(ROOT / "tests" / ".uicheck"))
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+# 离屏平台默认**不加载任何字体**（实测字体族 = 0），结果是 QLabel / QPushButton /
+# QTextBrowser 的文字全部绘制为空——截图里只有封面图和色块，看不到一个字。
+# 指定系统字体目录后，Qt 的 basic font database 才会去扫描字体（实测 0 → 107 个族）。
+# 这一步必须在 QApplication 创建之前完成，所以放在所有 PyQt5 导入之前。
+if not os.environ.get("QT_QPA_FONTDIR"):
+    for candidate in (Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts",
+                      Path("/System/Library/Fonts"),
+                      Path("/usr/share/fonts")):
+        if candidate.is_dir():
+            os.environ["QT_QPA_FONTDIR"] = str(candidate)
+            break
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except AttributeError:  # pragma: no cover
@@ -36,11 +48,20 @@ except AttributeError:  # pragma: no cover
 shutil.rmtree(os.environ["NOVELFOUND_HOME"], ignore_errors=True)
 
 from PyQt5.QtCore import QEvent, QEventLoop, QPoint, Qt  # noqa: E402
-from PyQt5.QtGui import QKeyEvent  # noqa: E402
+from PyQt5.QtGui import (QColor, QFont, QFontDatabase, QImage, QKeyEvent,  # noqa: E402
+                         QMouseEvent, QPainter)
 from PyQt5.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 from novelfound.ui.main_window import MainWindow  # noqa: E402
 from novelfound.ui.theme import app_stylesheet  # noqa: E402
+
+# 兜底：万一 QT_QPA_FONTDIR 没生效（非 Windows 或路径不存在），手工注册几个字体文件，
+# 保证截图里的文字能画出来——否则"截图验收"会变成一次看不见字的空转。
+FALLBACK_FONTS = (
+    r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simsun.ttc",
+    r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\segoeui.ttf",
+    "/System/Library/Fonts/PingFang.ttc", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
 
 try:
     from PIL import Image
@@ -103,10 +124,36 @@ def image_stats(path: str) -> dict:
 
 app = QApplication(sys.argv)
 app.setStyleSheet(app_stylesheet())
+
+# 字体兜底 + 断言：没字体就没有文字，截图也就失去意义（这正是"截图全对但看不见字"的坑）
+if len(QFontDatabase().families()) == 0:
+    for font_path in FALLBACK_FONTS:
+        if Path(font_path).is_file():
+            QFontDatabase.addApplicationFont(font_path)
+FONT_FAMILIES = len(QFontDatabase().families())
+
 window = MainWindow()
 window.resize(1360, 880)
 window.show()
 pump(0.6)
+
+check("离屏环境已加载字体（否则截图里没有文字）", FONT_FAMILIES > 0,
+      f"{FONT_FAMILIES} 个字体族 / QT_QPA_FONTDIR="
+      f"{os.environ.get('QT_QPA_FONTDIR', '未设置')}")
+
+# 直接验证"文字真的能画出来"——比事后统计截图颜色硬得多：
+# 之前那批 Pillow 统计（colors>30 / lum>150）在"全图只有色块、一个字都没有"时照样通过。
+_probe = QImage(240, 60, QImage.Format_RGB32)
+_probe.fill(QColor("#F7F3E9"))
+_painter = QPainter(_probe)
+_painter.setFont(QFont("Microsoft YaHei UI", 20))
+_painter.setPen(QColor("#333333"))
+_painter.drawText(_probe.rect(), Qt.AlignCenter, "斗罗大陆 ABC")
+_painter.end()
+_bg = QColor("#F7F3E9").rgb()
+_text_px = sum(1 for y in range(60) for x in range(240)
+               if _probe.pixel(x, y) != _bg)
+check("离屏渲染能画出文字（截图验收的前提）", _text_px > 200, f"{_text_px} 个文字像素")
 
 # ---------------------------------------------------------------- 1. 初始界面
 check("窗口尺寸", window.width() >= 1200 and window.height() >= 700,
@@ -274,6 +321,9 @@ if ok:
         check("正文左右留白对称", abs(left_gap - right_gap) <= 8,
               f"left={left_gap} right={right_gap}")
 
+        # ---- 阅读时收起顶部应用栏（沉浸阅读）----
+        check("阅读时隐藏顶部应用栏", not window.top_bar.isVisible(), "")
+
         # ---- P0：上下浮条默认隐藏，可显式唤出 ----
         check("阅读器浮条默认隐藏", not window.reader.bars_visible(), "")
         window.reader.show_bars()
@@ -311,19 +361,104 @@ if ok:
                   window.catalog_drawer.catalog.currentRow()).text().startswith("▶"),
               "")
         window.close_catalog_drawer()
-        pump(0.2)
+        pump(0.5)                       # 等 200ms 淡出动画跑完
         check("关闭抽屉后遮罩隐藏", not window.scrim.isVisible(), "")
 
+        # ---- P2：阅读设置浮层（Aa，改动即时生效）----
+        check("常驻的设置控件已收进浮层",
+              not hasattr(window.reader, "theme_box")
+              and not hasattr(window.reader, "columns_box"), "")
+        check("浮层不参与布局（画布的子控件）",
+              window.reader.settings_popover.parent() is window.reader.canvas, "")
+        window.reader.settings_button.click()
+        pump(0.3)
+        check("点 Aa 打开阅读设置浮层", window.reader.settings_popover.isVisible(), "")
+        check("浮层含字号/字体/行距/段距/页宽/缩进/主题/方式/排版",
+              all(hasattr(window.reader.settings_popover, name) for name in
+                  ("font_up", "font_down", "font_family_box", "line_height_box",
+                   "para_spacing_box", "indent_box", "content_width_box",
+                   "theme_box", "mode_button", "columns_box")), "")
+        shot("16_reader_settings")
+        cursor = window.reader.view.textCursor()
+        cursor.setPosition(1)
+        size_before = cursor.charFormat().font().pointSize()
+        window.reader.settings_popover.font_up.click()
+        pump(0.6)
+        cursor = window.reader.view.textCursor()
+        cursor.setPosition(1)
+        size_after = cursor.charFormat().font().pointSize()
+        check("浮层改字号后正文立即重绘", size_after == size_before + 1,
+              f"{size_before} -> {size_after}")
+        line_before = window.reader._line_height
+        window.reader.settings_popover.line_height_box.setValue(
+            round(line_before + 0.2, 1))
+        pump(0.6)
+        check("浮层改行距后立即生效",
+              abs(window.reader._line_height - (line_before + 0.2)) < 0.01,
+              f"{line_before} -> {window.reader._line_height}")
+        window.reader.settings_popover.line_height_box.setValue(line_before)
+        window.reader.settings_popover.font_down.click()
+        pump(0.5)
+        window.reader.settings_popover.close_popover()
+        pump(0.2)
+        check("浮层可关闭", not window.reader.settings_popover.isVisible(), "")
+
+        # ---- 点正文任意处应收起设置浮层（回归：以前点了正文浮层还在）----
+        window.reader.settings_button.click()
+        pump(0.3)
+        check("浮层可再次打开", window.reader.settings_popover.isVisible(), "")
+        _body = window.reader.view.viewport()
+        app.sendEvent(_body, QMouseEvent(QEvent.MouseButtonPress, QPoint(10, 10),
+                                         Qt.LeftButton, Qt.LeftButton, Qt.NoModifier))
+        pump(0.3)
+        check("点正文收起阅读设置浮层",
+              not window.reader.settings_popover.isVisible(), "")
+        window.reader.settings_button.click()
+        pump(0.3)
+        window.reader.keyPressEvent(
+            QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+        pump(0.2)
+        check("Esc 也收起阅读设置浮层",
+              not window.reader.settings_popover.isVisible(), "")
+
+        # ---- P2：浮条是"显式状态机 + 200ms 淡入淡出" ----
+        check("浮条隐藏状态立即生效",
+              not window.reader.bars_visible(), "")
+        window.reader.show_bars()
+        check("show_bars 后状态即可见（不等动画）", window.reader.bars_visible(), "")
+        bar_anim = getattr(window.reader.top_bar, "_animation", None)
+        check("浮条淡入动画时长 200ms",
+              bar_anim is not None and bar_anim.duration() == 200,
+              f"{bar_anim.duration() if bar_anim else 'none'}ms")
+        window.reader.top_bar.maybe_auto_hide()
+        window.reader.bottom_bar.maybe_auto_hide()
+        check("maybe_auto_hide 后状态即隐藏", not window.reader.bars_visible(), "")
+
+        # ---- 分页相关断言改用"内容量确定"的合成正文 ----
+        # 真实章节偶尔很短（比如只有一屏的卷首说明），"翻屏前进""恢复位置"这类
+        # 相对断言就会失真。这里换成固定长度的合成正文，断言才有意义。
+        from novelfound.models import ChapterContent  # noqa: E402
+        synthetic = ChapterContent(
+            title="分页自检章节",
+            paragraphs=[f"第 {i} 段：这是用于分页自检的正文内容，长度大致固定，"
+                        f"方便验证一页能装下多少行文字。" for i in range(80)],
+            url="about:pagination-selftest")
+        window.reader.set_content(synthetic, index=window.reader.chapter_index)
+        pump(0.5)
+        check("合成正文已加载（分页断言的可重复前提）",
+              len(window.reader._paragraphs) > 60,
+              f"段落={len(window.reader._paragraphs)}")
+
         # ---- 分栏（左右双页）----
-        window.reader.mode_button.setChecked(True)      # 切到翻页模式
+        window.reader.settings_popover.mode_button.setChecked(True)      # 切到翻页模式
         pump(0.8)
         check("翻页模式已启用", window.reader._page_mode, "")
         check("单页模式右页隐藏", not window.reader.view2.isVisible(), "")
         single_pages = len(window.reader._page_offsets)
         check("单页模式已分页", single_pages > 1, f"pages={single_pages}")
 
-        window.reader.columns_box.setCurrentIndex(
-            window.reader.columns_box.findData(2))
+        window.reader.settings_popover.columns_box.setCurrentIndex(
+            window.reader.settings_popover.columns_box.findData(2))
         pump(1.0)
         check("双页模式已开启", window.reader._two_page, "")
         check("双页模式右页可见", window.reader.right_column.isVisible(), "")
@@ -430,9 +565,10 @@ if ok:
                             QPoint(0, -120), Qt.NoButton, Qt.NoModifier,
                             Qt.NoScrollPhase, False)
         app.sendEvent(viewport, wheel)
-        pump(0.3)
+        pump(0.4)
         check("滚轮在正文上翻页", window.reader._spread == spread_before + 1,
-              f"{spread_before} -> {window.reader._spread}")
+              f"{spread_before} -> {window.reader._spread} "
+              f"（屏数 {window.reader.spread_count()}）")
 
         # 翻一屏：左右两页都往前走
         before_spread = window.reader._spread
@@ -462,8 +598,8 @@ if ok:
               f"first={restored_left} target={target_offset}")
 
         # 切回单页
-        window.reader.columns_box.setCurrentIndex(
-            window.reader.columns_box.findData(1))
+        window.reader.settings_popover.columns_box.setCurrentIndex(
+            window.reader.settings_popover.columns_box.findData(1))
         pump(0.6)
         check("切回单页后右页隐藏", not window.reader.right_column.isVisible(), "")
 
@@ -484,19 +620,27 @@ if ok:
               f"doc={cursor.charFormat().font().pointSize()}")
 
         # 首行缩进
-        indent = window.reader.view.document().firstBlock().blockFormat().textIndent()
+        # 注意：不能只看"当前页第一块"——翻页模式下第一块可能是**续页片段**
+        # （continuation 格式，缩进按设计就是 0），于是断言会随分页边界随机飘。
+        # 这里取本页所有块里最大的缩进：只要页内有段落起始，就应当 > 0。
+        def page_indent() -> float:
+            document = window.reader.view.document()
+            return max((document.findBlockByNumber(i).blockFormat().textIndent()
+                        for i in range(document.blockCount())), default=0.0)
+
+        indent = page_indent()
         check("默认首行缩进生效（2 字符）", indent > 0, f"indent={indent:.1f}px")
         window.config.set("first_line_indent", 0)
         window.reader.apply_settings()
         window.reader.render()
         pump(0.3)
-        indent_off = window.reader.view.document().firstBlock().blockFormat().textIndent()
+        indent_off = page_indent()
         check("首行缩进可关闭", indent_off == 0, f"indent={indent_off}")
         window.config.set("first_line_indent", 2)
         window.reader.apply_settings()
         window.reader.render()
         pump(0.3)
-        indent_on = window.reader.view.document().firstBlock().blockFormat().textIndent()
+        indent_on = page_indent()
         check("首行缩进可恢复", indent_on > 0, f"indent={indent_on:.1f}px")
 
         window.config.set("reader_theme", "night")
@@ -504,10 +648,16 @@ if ok:
         window.reader.render()
         stats = image_stats(shot("05_reader_night"))
         check("夜间主题渲染为深色", stats["lum"] < 110, f"lum={stats['lum']:.1f}")
+        # 状态栏要跟着阅读主题走（回归：曾是"浅色外壳夹着深色正文"）
+        check("阅读时顶部应用栏保持隐藏", not window.top_bar.isVisible(), "")
+        _status = window.statusBar().grab().toImage()
+        _status_pixel = _status.pixelColor(_status.width() // 2, _status.height() // 2)
+        check("夜间主题下状态栏跟随变暗", _status_pixel.lightness() < 110,
+              f"#{_status_pixel.name()}")
 
         window.config.set("reader_theme", "sepia")
         window.reader.apply_settings()
-        window.reader.mode_button.setChecked(True)
+        window.reader.settings_popover.mode_button.setChecked(True)
         window.reader.render()
         pump(0.3)
         check("翻页模式隐藏滚动条",
@@ -533,21 +683,36 @@ if ok:
         ok = wait_for(lambda: window.reader.chapter_index == index_before, 40)
         check("上一章可切换", ok, f"回到 {window.reader.chapter_index}")
 
-        night_index = window.reader.theme_box.findData("night")
-        window.reader.theme_box.setCurrentIndex(night_index)
+        night_index = window.reader.settings_popover.theme_box.findData("night")
+        window.reader.settings_popover.theme_box.setCurrentIndex(night_index)
         pump(0.4)
         cursor = window.reader.view.textCursor()
         cursor.setPosition(1)
         color = cursor.charFormat().foreground().color().name()
         check("下拉切换主题后文字颜色同步", color.lower() == "#c2c9d1", f"color={color}")
-        eye_index = window.reader.theme_box.findData("eye")
-        window.reader.theme_box.setCurrentIndex(eye_index)
+        eye_index = window.reader.settings_popover.theme_box.findData("eye")
+        window.reader.settings_popover.theme_box.setCurrentIndex(eye_index)
         pump(0.3)
 
         # 滚动位置恢复属于滚动模式，先切回去
-        window.reader.mode_button.setChecked(False)
+        window.reader.settings_popover.mode_button.setChecked(False)
         pump(0.6)
         check("切回滚动模式", not window.reader._page_mode, "")
+
+        # 滚动恢复断言需要一章"足够长的真实正文"：短章节（卷首说明之类）就往后翻几章找
+        for candidate in range(index_before,
+                               min(index_before + 4, window.reader.chapter_count)):
+            window.load_chapter(candidate)
+            wait_for(lambda: window.reader.chapter_index == candidate
+                     and bool(window.reader._paragraphs), 40)
+            pump(0.4)
+            if window.reader.view.verticalScrollBar().maximum() >= 700:
+                break
+        index_before = window.reader.chapter_index
+        check("已定位到足够长的一章（用于滚动恢复断言）",
+              window.reader.view.verticalScrollBar().maximum() >= 700,
+              f"第 {index_before + 1} 章 max="
+              f"{window.reader.view.verticalScrollBar().maximum()}")
 
         bar = window.reader.view.verticalScrollBar()
         bar.setValue(600)
@@ -570,6 +735,12 @@ if ok:
         window.on_reader_back()
         pump(0.4)
         check("返回详情页", window.stack.currentWidget() is window.book_view, "")
+        check("离开阅读器后顶部应用栏恢复", window.top_bar.isVisible(), "")
+        _back_shell = window.top_bar.grab().toImage()
+        _back_pixel = _back_shell.pixelColor(_back_shell.width() // 2,
+                                             _back_shell.height() // 2)
+        check("恢复后的顶栏是暖白", _back_pixel.lightness() > 200,
+              f"#{_back_pixel.name()}")
         check("返回后主按钮仍是继续阅读",
               window.book_view.read_button.text() == "继续阅读",
               window.book_view.read_button.text())
@@ -584,19 +755,66 @@ pump(0.6)
 check("书架首页显示", window.stack.currentWidget() is window.library_view, "")
 check("书架网格渲染", len(window.library_view.tiles()) >= 1,
       f"{len(window.library_view.tiles())} 个格子")
-check("最近阅读记录存在", bool(window.library.history()),
-      f"{len(window.library.history())} 条")
+check("首页不再有「继续阅读」栏目",
+      not hasattr(window.library_view, "continue_card"), "")
+check("首页不再有「最近阅读」栏目",
+      not hasattr(window.library_view, "recent_title"), "")
+check("首页只有书架网格 + 空状态",
+      window.library_view.scroll.isVisible() and
+      not window.library_view.empty.isVisible(), "")
 saved_progress = window.library.progress(window.current_book.key)
-check("继续阅读卡片存在", window.library_view.continue_card is not None, "")
-if window.library_view.continue_card is not None:
-    card = window.library_view.continue_card
-    check("继续阅读显示上次章节",
-          str(saved_progress.get("index", -1) + 1) in card.chapter_label.text(),
-          card.chapter_label.text())
-    check("继续阅读显示百分比文字",
-          card.percent_label.text().endswith("%") or card.percent_label.text() == "未读",
-          card.percent_label.text())
-    check("继续阅读卡片不放进度条", not card.findChildren(ProgressLine), "")
+tile_texts = [t.status_label.text() for t in window.library_view.tiles()]
+check("书架格子显示百分比文字",
+      all(t.endswith("%") or t == "未读" for t in tile_texts), str(tile_texts))
+check("书架格子不放进度条",
+      not any(t.findChildren(ProgressLine) for t in window.library_view.tiles()), "")
+# P2：封面角标 + 悬停效果
+badge_texts = [t.badge.text() for t in window.library_view.tiles()]
+check("封面右下角有进度角标",
+      len(badge_texts) == len(tile_texts) and badge_texts == tile_texts,
+      str(badge_texts))
+first_tile = window.library_view.tiles()[0]
+check("角标贴在封面内（是封面的子控件）", first_tile.badge.parent() is first_tile.cover, "")
+check("角标位置在封面右下角",
+      first_tile.badge.x() + first_tile.badge.width() <= first_tile.cover.width()
+      and first_tile.badge.y() + first_tile.badge.height() <= first_tile.cover.height()
+      and first_tile.badge.x() + first_tile.badge.width()
+      >= first_tile.cover.width() * 0.75
+      and first_tile.badge.y() + first_tile.badge.height()
+      >= first_tile.cover.height() * 0.75,
+      f"badge=({first_tile.badge.x()},{first_tile.badge.y()}) "
+      f"{first_tile.badge.width()}x{first_tile.badge.height()} "
+      f"cover={first_tile.cover.width()}x{first_tile.cover.height()}")
+check("角标不挡鼠标（点击落到卡片上）",
+      first_tile.badge.testAttribute(Qt.WA_TransparentForMouseEvents), "")
+# 角标必须有深色药丸底（回归：CoverLabel 的样式表会连子控件一起生效，
+# 曾把 #coverBadge 的背景盖掉，角标只剩文字、白底上看不出是标签）
+_cover_img = first_tile.cover.grab().toImage()
+_badge_rect = first_tile.badge.geometry()
+_dark = _light = 0
+for _y in range(_badge_rect.top(), min(_badge_rect.bottom() + 1, _cover_img.height())):
+    for _x in range(_badge_rect.left(), min(_badge_rect.right() + 1, _cover_img.width())):
+        if _cover_img.pixelColor(_x, _y).lightness() < 150:
+            _dark += 1
+        else:
+            _light += 1
+check("角标有深色药丸底", _dark > _light,
+      f"深色占比={_dark / max(1, _dark + _light):.0%}")
+check("封面默认没有悬停薄纱", not first_tile.cover.is_hovered(), "")
+first_tile.enterEvent(QMouseEvent(QEvent.Enter, QPoint(5, 5), Qt.NoButton,
+                                  Qt.NoButton, Qt.NoModifier))
+check("鼠标移入后封面出现悬停提示", first_tile.cover.is_hovered(), "")
+first_tile.leaveEvent(QMouseEvent(QEvent.Leave, QPoint(5, 5), Qt.NoButton,
+                                  Qt.NoButton, Qt.NoModifier))
+check("鼠标移出后悬停提示消失", not first_tile.cover.is_hovered(), "")
+shot("17_library_tiles")
+check("书架标题带数量",
+      f"（{len(window.library.books())}）" in window.library_view.shelf_title.text(),
+      window.library_view.shelf_title.text())
+check("首页只显示书架里的书（不含仅历史记录的书）",
+      len(window.library_view.tiles()) == len(window.library.books()),
+      f"格子={len(window.library_view.tiles())} 书架={len(window.library.books())} "
+      f"历史={len(window.library.history())}")
 stats = image_stats(shot("08_library_home"))
 check("书架首页非空白", stats["colors"] > 30, f"colors={stats['colors']}")
 
@@ -623,13 +841,23 @@ fresh_view.deleteLater()
 
 # ------------------------------------------------------ 5c. 目录抽屉
 check("目录抽屉默认关闭", not window.catalog_drawer.is_open(), "")
+# P2：动画时长（方案要求 200–300ms）
+from novelfound.ui.widgets import DRAWER_MS, FADE_MS  # noqa: E402
+
+check("淡入淡出时长在 200–300ms", 200 <= FADE_MS <= 300, f"{FADE_MS}ms")
+check("抽屉滑出时长在 200–300ms", 200 <= DRAWER_MS <= 300, f"{DRAWER_MS}ms")
 window.open_catalog_drawer()
+pump(0.15)
+drawer_anim = getattr(window.catalog_drawer, "_animation", None)
+check("抽屉滑出动画确实在跑",
+      drawer_anim is not None and drawer_anim.duration() == DRAWER_MS,
+      f"{drawer_anim.duration() if drawer_anim else 'none'}ms")
 pump(0.4)
 check("抽屉可打开", window.catalog_drawer.is_open(), "")
 check("抽屉打开时遮罩可见", window.scrim.isVisible(), "")
 shot("13_catalog_drawer")
 window.scrim.clicked.emit()          # 点遮罩关闭
-pump(0.3)
+pump(0.5)
 check("点遮罩关闭抽屉", not window.catalog_drawer.is_open(), "")
 check("关闭抽屉后遮罩隐藏", not window.scrim.isVisible(), "")
 window.on_read_requested(window.current_detail, 2)
@@ -655,6 +883,201 @@ for _ in range(6):
     pump(0.6)
 check("滚动后封面队列被消费", len(window._cover_pending) < len(rows),
       f"pending={len(window._cover_pending)} rows={len(rows)}")
+window.close_search_palette()
+pump(0.3)
+
+# ---------------------------------------------------- 5e. 浏览历史（右上角 🕘）
+check("右上角有浏览历史按钮", window.history_button.text() == "🕘",
+      window.history_button.text())
+history_items = window.history.items()
+_book_key = window.current_book.key
+check("这本书在历史里只有一条记录",
+      sum(1 for i in history_items if i["key"] == _book_key) == 1,
+      f"共 {len(history_items)} 条 / 本书 "
+      f"{sum(1 for i in history_items if i['key'] == _book_key)} 条")
+check("读完返回后记录为「阅读」且带章节",
+      any(i["key"] == _book_key and i["kind"] == "chapter" for i in history_items),
+      str([(i["kind"], i["chapter_index"]) for i in history_items
+           if i["key"] == _book_key]))
+check("历史里没有重复的书",
+      len({i["key"] for i in history_items}) == len(history_items), "")
+check("历史上限为 30 条", window.history.count() <= 30,
+      f"{window.history.count()} 条")
+check("历史条目带书名与时间戳",
+      all(i.get("title") and i.get("at") for i in history_items), "")
+
+window.open_history_panel()
+pump(0.4)
+check("点 🕘 打开浏览历史面板", window.history_panel.is_open(), "")
+check("历史面板打开时遮罩可见", window.scrim.isVisible(), "")
+check("历史面板行数与记录数一致",
+      len(window.history_panel.rows()) == len(history_items),
+      f"行={len(window.history_panel.rows())} 记录={len(history_items)}")
+check("历史面板显示条数", "共" in window.history_panel.count_label.text(),
+      window.history_panel.count_label.text())
+panel_rows = window.history_panel.rows()
+check("历史行显示动作标签与时间",
+      panel_rows and panel_rows[0].kind_label.text() in ("浏览", "阅读")
+      and bool(panel_rows[0].time_label.text()),
+      f"{panel_rows[0].kind_label.text()} / {panel_rows[0].time_label.text()}"
+      if panel_rows else "无行")
+check("首行是最近一次动作（阅读）", panel_rows[0].kind_label.text() == "阅读",
+      panel_rows[0].kind_label.text())
+shot("15_history_panel")
+# 键盘 Esc 关闭
+QApplication.sendEvent(window.history_panel.list,
+                       QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+window.history_panel.keyPressEvent(
+    QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
+pump(0.3)
+check("Esc 关闭浏览历史面板", not window.history_panel.is_open(), "")
+check("关闭历史面板后遮罩隐藏", not window.scrim.isVisible(), "")
+
+# 点一条「阅读」记录 → 直接回到当时那一章
+chapter_row = next((i for i, r in enumerate(window.history_panel.rows())
+                    if r.entry.get("kind") == "chapter"), -1)
+if chapter_row >= 0:
+    window.open_history_panel()
+    pump(0.3)
+    target_entry = window.history_panel.rows()[chapter_row].entry
+    window.history_panel.list.setCurrentRow(chapter_row)
+    window.history_panel._on_item_activated(
+        window.history_panel.list.item(chapter_row))
+    ok = wait_for(lambda: window.stack.currentWidget() is window.reader
+                  and window.reader.chapter_index == target_entry["chapter_index"], 40)
+    check("点历史条目回到当时那一章", ok,
+          f"期望第 {target_entry['chapter_index'] + 1} 章 / "
+          f"当前第 {window.reader.chapter_index + 1} 章")
+    check("点历史条目后浮层已关闭", not window.history_panel.is_open(), "")
+
+# 再打开一次详情：仍然只有一条（按书去重），且不会丢掉"读到哪一章"
+# 注意：这段必须在"清空历史"之前，否则历史已空、无从继承章节信息。
+window.on_book_clicked(window.current_book)
+wait_for(lambda: window.current_detail is not None, 40)
+pump(0.8)
+_entry_after = next((i for i in window.history.items() if i["key"] == _book_key), {})
+check("重新打开同一本书详情不新增记录",
+      sum(1 for i in window.history.items() if i["key"] == _book_key) == 1,
+      f"本书 {sum(1 for i in window.history.items() if i['key'] == _book_key)} 条")
+check("重开详情不会丢掉已读章节", _entry_after.get("chapter_index", -1) >= 0,
+      f"chapter_index={_entry_after.get('chapter_index')} "
+      f"kind={_entry_after.get('kind')}")
+
+# 清空
+before_clear = window.history.count()
+window.open_history_panel()
+pump(0.3)
+window.history_panel.clear_button.click()
+pump(0.4)
+check("清空历史生效", window.history.count() == 0, f"{before_clear} -> 0")
+check("清空后显示空提示", window.history_panel.hint.isVisible(), "")
+check("清空后按钮提示更新", "暂无记录" in window.history_button.toolTip(),
+      window.history_button.toolTip())
+window.close_history_panel()
+pump(0.2)
+
+# ------------------------------------------- 5f. 本地 TXT / EPUB 导入与阅读
+import zipfile as _zipfile  # noqa: E402
+
+from novelfound.localbooks import COVER_PREFIX  # noqa: E402
+
+_local_dir = ROOT / "tests" / ".tmp" / "localimport"
+_local_dir.mkdir(parents=True, exist_ok=True)
+_txt_path = _local_dir / "本地测试书.txt"
+_txt_path.write_text(
+    "书名：本地测试书\n作者：测试作者\n\n"
+    "第一章 开端\n" + "第一段正文内容，用于本地导入自检。" * 8 + "\n"
+    "第二章 继续\n" + "第二段正文内容，用于本地导入自检。" * 8 + "\n",
+    encoding="utf-8")
+
+_epub_path = _local_dir / "本地EPUB.epub"
+with _zipfile.ZipFile(_epub_path, "w") as _archive:
+    _archive.writestr("mimetype", "application/epub+zip")
+    _archive.writestr("META-INF/container.xml",
+                      '<?xml version="1.0"?><container version="1.0" '
+                      'xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                      '<rootfiles><rootfile full-path="OEBPS/content.opf" '
+                      'media-type="application/oebps-package+xml"/></rootfiles></container>')
+    _archive.writestr("OEBPS/content.opf",
+                      '<?xml version="1.0" encoding="utf-8"?>'
+                      '<package xmlns="http://www.idpf.org/2007/opf" version="2.0" '
+                      'unique-identifier="id"><metadata '
+                      'xmlns:dc="http://purl.org/dc/elements/1.1/">'
+                      '<dc:title>本地 EPUB 测试书</dc:title>'
+                      '<dc:creator>EPUB 作者</dc:creator></metadata><manifest>'
+                      '<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>'
+                      '</manifest><spine><itemref idref="c1"/></spine></package>')
+    _archive.writestr("OEBPS/c1.xhtml",
+                      '<?xml version="1.0" encoding="utf-8"?><html '
+                      'xmlns="http://www.w3.org/1999/xhtml"><body><h1>第一章 EPUB</h1>'
+                      '<p>EPUB 正文内容，用于本地导入自检。</p></body></html>')
+
+window.import_local_books([str(_txt_path), str(_epub_path)])
+# 注意：等的是"真的进了书架"，不能只等 local_books.count()——那个在导入循环里就会变，
+# 而 finished 回调（写书架 + 刷新首页）要等任务整体结束。
+ok = wait_for(lambda: window.local_books.count() >= 2
+              and any(t.book.title == "本地测试书" for t in window.library_view.tiles())
+              and any(t.book.title == "本地 EPUB 测试书"
+                      for t in window.library_view.tiles()), 90)
+check("导入本地 TXT / EPUB 成功", ok, f"{window.local_books.count()} 本")
+_lb_txt = next((i for i in window.local_books.all() if i["format"] == "txt"), None)
+_lb_epub = next((i for i in window.local_books.all() if i["format"] == "epub"), None)
+check("TXT 解析出章节", bool(_lb_txt) and len(_lb_txt["chapters"]) == 2,
+      f"章节={len(_lb_txt['chapters']) if _lb_txt else 0}")
+check("TXT 读到文件内的书名/作者",
+      bool(_lb_txt) and _lb_txt["title"] == "本地测试书"
+      and _lb_txt["author"] == "测试作者",
+      f"{_lb_txt['title'] if _lb_txt else ''} / {_lb_txt['author'] if _lb_txt else ''}")
+check("EPUB 解析出书名与章节",
+      bool(_lb_epub) and _lb_epub["title"] == "本地 EPUB 测试书"
+      and len(_lb_epub["chapters"]) == 1,
+      f"{_lb_epub['title'] if _lb_epub else ''}")
+
+_titles = [t.book.title for t in window.library_view.tiles()]
+check("导入的书出现在书架首页", "本地测试书" in _titles, str(_titles[:4]))
+check("导入的书已记入书架（有章节数）",
+      window.library.contains(window.local_books.to_book(_lb_txt).key), "")
+
+# 打开详情 → 目录 → 读正文（关键：不只能导入，还要能读）
+_local_book = window.local_books.to_book(_lb_txt)
+window.on_book_clicked(_local_book)
+ok = wait_for(lambda: window.current_detail is not None
+              and window.current_detail.book.key == _local_book.key, 40)
+check("本地书能打开详情", ok, "")
+check("本地书目录已生成", ok and len(window.current_detail.chapters) == 2,
+      f"{len(window.current_detail.chapters) if ok else 0} 章")
+if ok:
+    window.on_read_requested(window.current_detail, 1)
+    # 等"这一章的正文"出现，不能只等 _paragraphs 非空——它可能还是上一章的内容
+    ok = wait_for(lambda: "第二段正文内容" in "".join(window.reader._paragraphs), 40)
+    _text = "".join(window.reader._paragraphs)
+    check("本地书能读正文（第二章）",
+          ok and "第二段正文内容" in _text, f"{len(window.reader._paragraphs)} 段")
+    check("本地书读的是本地书源",
+          window.current_source is not None and window.current_source.key == "local",
+          window.current_source.key if window.current_source else "无")
+    shot("18_local_reader")
+    window.on_reader_back()
+    pump(0.4)
+
+# EPUB 也要能读
+_local_epub_book = window.local_books.to_book(_lb_epub)
+window.on_book_clicked(_local_epub_book)
+ok = wait_for(lambda: window.current_detail is not None
+              and window.current_detail.book.key == _local_epub_book.key, 40)
+if ok:
+    window.on_read_requested(window.current_detail, 0)
+    ok = wait_for(lambda: "EPUB 正文内容" in "".join(window.reader._paragraphs), 40)
+    check("EPUB 能读正文", ok, f"{len(window.reader._paragraphs)} 段")
+    window.on_reader_back()
+    pump(0.4)
+
+# 搜索里也能搜到本地书
+window.open_search_palette("本地测试书")
+ok = wait_for(lambda: any(r.book.title == "本地测试书"
+                          for r in window.search_palette.rows()), 60)
+check("本地书可被搜索到", ok,
+      f"结果={[r.book.title for r in window.search_palette.rows()][:3]}")
 window.close_search_palette()
 pump(0.3)
 
@@ -921,17 +1344,29 @@ dialog.resize(780, 620)
 dialog.show()
 pump(0.6)
 check("书源列表非空", dialog.source_list.count() >= 3, f"{dialog.source_list.count()} 条")
-check("设置页含首行缩进项", dialog.first_indent.value() == 2,
-      f"value={dialog.first_indent.value()}")
 check("设置页不再有侧栏选项", not hasattr(dialog, "auto_hide_sidebar"), "")
+check("设置页不再重复阅读项（已收进 Aa 浮层）",
+      not any(hasattr(dialog, name) for name in
+              ("font_size", "theme_box", "columns_box", "first_indent",
+               "content_width", "line_height", "mode_box")), "")
+check("阅读项只在阅读器浮层里", 
+      window.reader.settings_popover.indent_box.value() ==
+      int(window.config.get("first_line_indent") or 0),
+      f"indent={window.reader.settings_popover.indent_box.value()}")
 check("设置页含同站请求间隔与封面并发",
       dialog.request_interval.value() > 0 and dialog.cover_concurrent.value() >= 1,
       f"interval={dialog.request_interval.value()} cover={dialog.cover_concurrent.value()}")
 check("设置页含探测入口",
       any("探测新书源" in b.text() for b in dialog.findChildren(QPushButton)), "")
 dialog.grab().save(str(OUT / "09_settings.png"))
-check("设置项默认值", dialog.font_size.value() >= 12 and dialog.timeout.value() >= 3,
-      f"font={dialog.font_size.value()} timeout={dialog.timeout.value()}")
+# 对话框底色也必须是暖白（回归：页签面板曾用卡片色 BG_SURFACE，看着比主窗口白一档）
+_dialog_img = dialog.grab().toImage()
+_dialog_pixel = _dialog_img.pixelColor(_dialog_img.width() // 2,
+                                       _dialog_img.height() // 2)
+check("设置对话框底色为暖白", _dialog_pixel.name().upper() == "#F7F3E9",
+      f"#{_dialog_pixel.name()}")
+check("设置项默认值", dialog.strict_filter is not None and dialog.timeout.value() >= 3,
+      f"timeout={dialog.timeout.value()}")
 dialog.close()
 
 # ------------------------------------------------------------------ 汇总

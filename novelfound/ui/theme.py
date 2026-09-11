@@ -29,6 +29,16 @@ DIVIDER = "#E8E2D6"         # 极浅分隔线
 SCROLL_HANDLE = "#DCD5C7"
 SCROLL_HANDLE_HOVER = "#C9C0AE"
 
+# 文本选中高亮：不给就会用 Qt 默认的**系统蓝**，与"暖白 / 无蓝"的配色规范冲突。
+SELECTION_BG = "#E5DBC3"    # 暖沙色，比 BG_SELECTED 明显一点才看得出选中
+SELECTION_FG = TEXT_MAIN
+# 封面无图时的占位底色：原来是硬编码冷灰 #f2f4f7，在暖白背景上发蓝。
+PLACEHOLDER_BG = "#F1ECE0"
+PLACEHOLDER_FG = TEXT_FAINT
+# 封面右下角的进度角标（半透明深色药丸 + 暖白字）
+BADGE_BG = "rgba(45, 41, 35, 205)"
+BADGE_FG = BG_SURFACE
+
 # 强调色待定（方案：先不着急）。代码统一引用这个变量，定了只改这里。
 ACCENT = None
 WARN = "#8A6A2F"
@@ -82,6 +92,18 @@ def theme_is_dark(theme: Dict[str, str]) -> bool:
     return (0.299 * r + 0.587 * g + 0.114 * b) < 128
 
 
+def reader_selection(theme: Dict[str, str]) -> tuple:
+    """阅读器正文的选中色 (背景, 前景)。
+
+    浅色主题用暖沙色；深色主题用半亮灰蓝，保证"选中"在深底上也看得出来，
+    且都不使用 Qt 默认的系统蓝。
+    """
+    if theme_is_dark(theme):
+        return "#3C4650", theme.get("fg", "#c2c9d1")
+    return SELECTION_BG, theme.get("fg", TEXT_MAIN)
+
+
+
 def app_stylesheet() -> str:
     """主界面 QSS（暖白 + 少边框 + 无蓝色）。"""
     return f"""
@@ -91,6 +113,17 @@ def app_stylesheet() -> str:
         color: {TEXT_MAIN};
     }}
     QMainWindow, #centralArea {{ background: {BG_APP}; }}
+    /* 对话框也用暖白：原来只有窗口页签面板（QTabWidget::pane）有底色，
+       且用的是卡片色 BG_SURFACE，于是设置对话框看着比主窗口白一档。 */
+    QDialog, QTabWidget::pane {{ background: {BG_APP}; }}
+
+    /* 文本选中高亮统一用暖沙色。不写这几条时，Qt 会用**系统蓝**渲染选中态，
+       在搜索浮层打开（输入框自动全选）时尤其显眼，违反"暖白 / 不用蓝"的规范。 */
+    QLineEdit, QTextEdit, QPlainTextEdit, QTextBrowser {{
+        selection-background-color: {SELECTION_BG};
+        selection-color: {SELECTION_FG};
+    }}
+    QLabel {{ selection-background-color: {SELECTION_BG}; selection-color: {SELECTION_FG}; }}
 
     #topBar {{ background: {BG_APP}; border-bottom: 1px solid {DIVIDER}; }}
     QLineEdit#searchBox {{
@@ -166,7 +199,7 @@ def app_stylesheet() -> str:
         padding: 10px 10px 6px 10px; background: {BG_SURFACE};
     }}
     QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; color: {TEXT_SUB}; }}
-    QTabWidget::pane {{ border: 1px solid {DIVIDER}; border-radius: 6px; background: {BG_SURFACE}; }}
+    QTabWidget::pane {{ border: 1px solid {DIVIDER}; border-radius: 6px; background: {BG_APP}; }}
     QTabBar::tab {{
         background: transparent; padding: 7px 16px; color: {TEXT_SUB};
         border-bottom: 2px solid transparent;
@@ -201,6 +234,27 @@ def app_stylesheet() -> str:
     #coverTile:hover {{ background: {BG_HOVER}; }}
     #tileTitle {{ font-size: 13px; color: {TEXT_MAIN}; }}
     #tileMeta {{ font-size: 12px; color: {TEXT_SUB}; }}
+    /* 封面右下角的进度角标（半透明小圆角标签）。
+       实际样式由 widgets.CoverTile 给角标单独设置——父控件 CoverLabel 的样式表
+       会连子控件一起生效并盖掉这条，详见 CoverTile 里的注释。 */
+    #coverBadge {{
+        background: {BADGE_BG}; color: {BADGE_FG};
+        border-radius: 9px; padding: 1px 7px; font-size: 11px;
+    }}
+
+    /* 阅读设置浮层（Aa） */
+    #settingsPopover {{
+        background: {BG_SURFACE}; border: 1px solid {DIVIDER}; border-radius: 10px;
+    }}
+    #settingsPopover QLabel {{ color: {TEXT_SUB}; }}
+    #settingsPopover QToolButton {{
+        background: {BG_SURFACE}; border: 1px solid {DIVIDER}; border-radius: 6px;
+        padding: 4px 10px; color: {TEXT_MAIN};
+    }}
+    #settingsPopover QToolButton:hover {{ background: {BG_HOVER}; }}
+    #settingsPopover QToolButton:checked {{
+        background: {BG_SELECTED}; border-color: {TEXT_FAINT};
+    }}
 
     QPushButton#link {{
         background: transparent; border: none; padding: 2px 4px;
