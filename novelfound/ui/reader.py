@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """内置阅读器。
 
 特点：
@@ -10,11 +10,12 @@
 """
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 
-from PyQt5.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QTextBlockFormat,
-                         QTextCharFormat, QTextCursor)
+from PyQt5.QtCore import QEvent, QPoint, QUrl, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import (QColor, QFont, QFontMetrics, QImage, QTextBlockFormat,
+                         QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat)
 from PyQt5.QtWidgets import (QComboBox, QFrame, QHBoxLayout, QLabel, QSizePolicy,
                              QTextBrowser, QToolButton, QVBoxLayout, QWidget)
 
@@ -23,6 +24,17 @@ from ..models import ChapterContent
 from .reader_settings import ReaderSettingsPopover
 from .theme import READER_THEMES, reader_selection, reader_theme, theme_is_dark
 from .widgets import AutoHideBar, ProgressLine
+
+# 滚轮翻页参数：机械滚轮/触摸板常把"一格"拆成多个小事件发出来，
+# 按事件翻页会一次跳好几屏（内容整段丢失），所以按格累计、一次只翻一屏。
+WHEEL_NOTCH = 120            # 一格滚轮的 angleDelta
+WHEEL_PIXEL_NOTCH = 60       # 像素级滚动（触摸板）折算成一格的像素数
+WHEEL_COOLDOWN = 0.12        # 两次翻页的最小间隔（秒）
+MAX_PAGES_PER_CHAPTER = 4000 # 分页循环的安全上限（防止异常输入死循环）
+
+# 插图的显示高度上限（占页面高度的比例）：章首大图这类不能占满整页
+IMAGE_CHAR = "\ufffc"          # 插图占位字符（与 local_parse.IMAGE_CHAR 一致）
+IMAGE_MAX_HEIGHT_RATIO = 0.62
 
 
 class ReaderView(QWidget):
@@ -43,6 +55,11 @@ class ReaderView(QWidget):
         self.chapter_title = ""
         self._scroll_pos = 0
         self._paragraphs: List[str] = []
+        self._images: Dict[int, bytes] = {}      # 内嵌插图（段落序号 → 图片字节）
+        self._image_cache: Dict[tuple, object] = {}
+        self._wheel_accum = 0          # 滚轮累计当量（凑够一格才翻页）
+        self._wheel_pixels = 0         # 触摸板像素累计
+        self._last_turn = 0.0          # 上次翻页时间（抑制驱动连发）
         self._positions: Dict[str, int] = {}   # 章节地址 -> 滚动位置（本次会话内记忆）
         self._current_url = ""
         # 分页/双页状态
@@ -312,14 +329,21 @@ class ReaderView(QWidget):
             self.right_column.hide()
 
     def _apply_page_scrollbars(self) -> None:
-        """翻页模式下隐藏滚动条；万一某段比整页还高，才允许在页内滚动。"""
+        """翻页模式下**始终隐藏滚动条**（宽度必须恒定）。
+
+        这一条是真踩过坑的：早先做"某页比视口高就打开滚动条"的兜底，结果
+        滚动条占掉 ~10px → viewport 变窄 → 文字重排成更多行 → 更溢出 →
+        滚动条一直开着（**粘住**）；而分页是按"没有滚动条"的宽度算的，
+        于是底部几行被裁掉、看起来像**中间丢了一段内容**。
+        现在一律 AlwaysOff：宽度稳定，分页量与显示量一致。
+        真遇到比一页还高的单块（超大插图），分页会给它单独一页，
+        插图本身也有高度上限（``IMAGE_MAX_HEIGHT_RATIO``）。
+        """
         for view in (self.view, self.view2):
-            if not self._page_mode:
+            if self._page_mode:
+                view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+            else:
                 view.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-                continue
-            too_tall = view.document().size().height() > view.viewport().height() + 2
-            view.setVerticalScrollBarPolicy(
-                Qt.ScrollBarAsNeeded if too_tall else Qt.ScrollBarAlwaysOff)
 
     def _layout_overlays(self) -> None:
         """把上下浮条、进度线、阅读设置浮层贴到画布边缘（它们都不参与布局）。"""
@@ -400,17 +424,13 @@ class ReaderView(QWidget):
             self.settings_popover.close_popover()
         elif view is not None and event.type() == QEvent.Wheel and self._page_mode:
             # 翻页模式下，滚轮在正文上也应该整屏翻页；
-            # 只有"某段比整页还高、需要页内滚动"时才让视图自己滚。
+            # 只有"某段比整页还高、需要页内滚动"时才让视图自己滚（安全阀，避免卡住）
             bar = view.verticalScrollBar()
             delta = event.angleDelta().y()
             if bar.maximum() > 0 and ((delta < 0 and bar.value() < bar.maximum())
                                       or (delta > 0 and bar.value() > 0)):
                 return False
-            if delta < 0:
-                self.next_page()
-            else:
-                self.prev_page()
-            return True
+            return self._turn_from_wheel(delta, event.pixelDelta().y())
         return super().eventFilter(obj, event)
 
     def change_font_size(self, delta: int) -> None:
@@ -477,10 +497,15 @@ class ReaderView(QWidget):
         self._set_header(content.title, index)
         # 章首在正文里也放一个标题（大字号居中），只有本章第一段是它
         paragraphs = list(content.paragraphs)
+        images = dict(getattr(content, "images", {}) or {})
         title = (content.title or "").strip()
         if title:
             paragraphs = [title] + paragraphs
+            # 注意：插图的键是"段落序号"，插入标题后要整体 +1，否则会错位
+            images = {index + 1: data for index, data in images.items()}
         self._paragraphs = paragraphs
+        self._images = images
+        self._image_cache.clear()
         self._block_count = len(self._paragraphs)
         self._char_count = content.char_count
         self._from_cache = content.from_cache
@@ -615,6 +640,17 @@ class ReaderView(QWidget):
         continuation = QTextBlockFormat(body)
         continuation.setTextIndent(0)
 
+        # 插图段落：居中、不带缩进，**并且不能套用比例行距**。
+        # 图片那"一行"的 line.height() 就是图片高度（600px），
+        # 若按比例行距 190% 算，这一行的步进会变成 1140px：图片下方凭空多出
+        # 540px 空白，而且分页以为它高 1140 → 图片被挤到单独一页（落到右栏）。
+        image_block = QTextBlockFormat(body)
+        image_block.setAlignment(Qt.AlignCenter)
+        image_block.setTextIndent(0)
+        image_block.setTopMargin(0)
+        image_block.setBottomMargin(self._para_spacing)
+        image_block.setLineHeight(100, QTextBlockFormat.SingleHeight)
+
         heading = QTextBlockFormat(body)
         heading.setAlignment(Qt.AlignCenter)
         heading.setTextIndent(0)
@@ -630,7 +666,7 @@ class ReaderView(QWidget):
         heading_char = QTextCharFormat()
         heading_char.setFont(heading_font)
         heading_char.setForeground(QColor(theme["fg"]))
-        return body, continuation, heading, char, heading_char
+        return body, continuation, image_block, heading, char, heading_char
 
     def _render_into(self, view, paragraphs: List[str],
                      heading_first: bool = False) -> None:
@@ -650,7 +686,7 @@ class ReaderView(QWidget):
         if self._font_family:
             font.setFamily(self._font_family)
         font.setPointSize(self._font_size)
-        body, continuation, heading, char, heading_char = \
+        (body, continuation, image_block, heading, char, heading_char) = \
             self._block_formats(font, theme)
 
         document = view.document()
@@ -662,6 +698,22 @@ class ReaderView(QWidget):
         for index, (block_index, start, end) in enumerate(fragments):
             if index:
                 cursor.insertBlock()
+            image = self._image_for(block_index, start, end)
+            if image is not None:
+                # 内嵌插图：整段就一个对象替换符（只占 1 个字符，偏移不受影响）
+                cursor.setBlockFormat(image_block)
+                cursor.setCharFormat(char)
+                name = self._image_key(block_index)
+                # **必须把图片注册成文档资源**：QTextImageFormat 里只放名字，
+                # 文档按名字查资源，查不到就画"图片缺失"的破图图标（真实踩过）。
+                document.addResource(QTextDocument.ImageResource, QUrl(name), image)
+                fmt = QTextImageFormat()
+                fmt.setName(name)
+                scale = self._image_scale(image)
+                fmt.setWidth(max(1.0, image.width() * scale))
+                fmt.setHeight(max(1.0, image.height() * scale))
+                cursor.insertImage(fmt)
+                continue
             if heading_first and block_index == 0 and start == 0:
                 cursor.setBlockFormat(heading)
                 cursor.setCharFormat(heading_char)
@@ -676,22 +728,71 @@ class ReaderView(QWidget):
         view.moveCursor(QTextCursor.Start)
         view.verticalScrollBar().setValue(0)
 
+    # -------------------------------------------------------------- 内嵌插图
+    def _image_for(self, block_index: int, start: int, end: int):
+        """这一片段是不是"整段一张图"？是就返回 QImage（带缓存）。"""
+        if not self._images or block_index not in self._images:
+            return None
+        if end - start != 1:
+            return None                     # 被拆开的图片片段不画（正常不会发生）
+        return self._cached_image(block_index)
+
+    def _image_key(self, block_index: int) -> str:
+        return f"local-image://{self._current_url}/{block_index}"
+
+    def _cached_image(self, block_index: int):
+        """按图片字节缓存解码结果（同一张图可能被上千章引用，不能重复解码）。"""
+        key = (self._current_url, block_index)
+        cached = self._image_cache.get(key)
+        if cached is not None:
+            return cached
+        data = self._images.get(block_index) or b""
+        image = QImage()
+        if data:
+            image.loadFromData(data)
+        self._image_cache[key] = image
+        # 同一张图在不同章节里会重复出现，按数据指纹再缓存一份
+        if data and len(self._image_cache) < 64:
+            digest = hash(data)
+            self._image_cache.setdefault(("__digest__", digest), image)
+        return image
+
+    def _image_scale(self, image) -> float:
+        """图片显示比例：小图原尺寸，大图缩到**列宽与页面高度**以内。
+
+        高度上限很重要：有些书每章开头都放一张大图（实测一本书 600×600 的章首图
+        出现在 1394 章里），不限制就会占满整页、甚至比一页还高。
+        """
+        if image.isNull() or image.width() <= 0 or image.height() <= 0:
+            return 1.0
+        avail_w = max(120, self._column_widths()[0] - 16)
+        avail_h = max(120, int(self.view.viewport().height() * IMAGE_MAX_HEIGHT_RATIO))
+        return min(1.0, avail_w / float(image.width()), avail_h / float(image.height()))
+
     def _line_advance(self, block_layout, line_index: int,
-                      block_span: float) -> float:
+                      block_span: float = 0.0, is_image: bool = False) -> float:
         """第 line_index 行占用的高度（含行距）。
 
         Qt 的比例行距下，``QTextLine.height()`` 只是**文字本身**的高度，
-        行与行之间真正的步进是它乘以行距倍数（30 × 1.9 = 57），
-        早先按 ``height()`` 累加会让一页多塞两三行、底部被裁掉。
-        这里优先用相邻行的 y 差，最后一行用「块占位 - 行偏移」反推。
+        行与行之间真正的步进是它乘以行距倍数。
+
+        * **图片行**（``is_image=True``）：直接返回 ``line.height()``，就是图片高度。
+          图片不是文字，**绝不能乘行距倍数**——否则 600px 的插图会被算成 1140px：
+          图片下方凭空多出 540px 空白，分页还以为它放不下、把它挤到单独一页
+          （表现就是"图标跑到右栏、左栏下半截空着"）。
+        * 文字中间行：用相邻行的 ``y`` 差（最准）。
+        * 文字块内最后一行：用行距模型。**不要**用"块占位反推"——
+          ``blockBoundingRect`` 在比例行距下不含行距，而文档末尾那块还会用到
+          **可能过期的** ``document.size()``，反推值偏小 → 一页多塞一两行、
+          底部被裁掉（用户实测"内容缺了一段"就是这么来的）。
+          模型值（实测 55 vs 真实 51）略偏保守，宁可少放一行也不裁字。
         """
         count = block_layout.lineCount()
         line = block_layout.lineAt(line_index)
+        if is_image:
+            return line.height()
         if line_index + 1 < count:
             return block_layout.lineAt(line_index + 1).y() - line.y()
-        span = block_span - line.y()
-        if span > 0:
-            return span
         return line.height() * max(1.0, float(self._line_height))
 
     def _block_span(self, document, layout, block_index: int) -> float:
@@ -714,48 +815,86 @@ class ReaderView(QWidget):
         return max(0.0, layout.blockBoundingRect(block).height())
 
     def _paginate(self) -> None:
-        """按**行**分页：算出每页的起始字符偏移。
+        """按行分页：**渲染候选页并量它自己的行**，得出每页起始偏移。
 
-        整行放不下就整行推到下一页，所以一页永远以整行结束、不会溢出；
-        超长段落也会被拆到多页，不再需要滚动条。
+        为什么不用"整篇文档的行坐标"推算（老做法）：整篇文档里排的是**完整段落**，
+        而页面上是**段落片段**（续页片段不带首行缩进 → 断行位置可能不同），
+        图片块的真实高度也只有渲染出来才知道。实测这种差异会让个别页面多塞
+        ~100px（约 2 行），底部被裁掉——用户看到的就是"中间少了一段内容"。
+        所以这里逐页渲染、逐行量：一页渲染一次，代价可控，但结果**与实际显示一致**。
         """
         document = self.view.document()
-        layout = document.documentLayout()
         margin = document.documentMargin()
-        # 页面底部在文档坐标里的上限：文档高度 = 最后一行底部 + 下边距，
-        # 所以「内容底部 - 页顶 ≤ 视口高度 - 上下边距」即不溢出。
         available = self.view.viewport().height() - 2 * margin - 1
-        if document.size().height() <= 0 or available < 60:
-            # 文档尚未布局（例如窗口刚建好），按固定段落数兜底
-            self._page_offsets = []
-            pos = 0
-            for i, para in enumerate(self._paragraphs):
-                if i % 12 == 0:
-                    self._page_offsets.append(pos)
-                pos += len(para) + 1
-            if not self._page_offsets:
-                self._page_offsets = [0]
+        total = self._text_length
+        if total <= 0 or available < 60:
+            self._page_offsets = [0]
             return
 
         offsets = [0]
-        page_top = margin
-        for block_index in range(document.blockCount()):
-            block = document.findBlockByNumber(block_index)
+        # 各段在"全章文本"里的起始偏移（段落之间用 \n 连接，和 _fragments_for_range 一致）
+        para_starts: List[int] = []
+        position = 0
+        for para in self._paragraphs:
+            para_starts.append(position)
+            position += len(para) + 1
+
+        chars_guess = max(400, int(available * 1.2))
+        while offsets[-1] < total and len(offsets) <= MAX_PAGES_PER_CHAPTER:
+            start = offsets[-1]
+            # 先渲染一个"足够宽"的候选范围（按上一页的字数外推，多给一倍量），
+            # 再在渲染结果上找真正放得下的最后一行
+            window = min(total, start + max(64, int(chars_guess * 2)))
+            fragments = self._fragments_for_range(start, window)
+            if not fragments:
+                break
+            # heading_first 必须与实际显示页一致：页面渲染时每页都传 True
+            # （内部条件 start == 0 才真的用章首格式）。不一致的话分页按正文字体
+            # 量、实际按大字号画，最后一页就会溢出被裁。
+            self._render_fragments(self.view, fragments, self._paragraphs,
+                                   heading_first=True)
+            page_end = self._last_fitting_offset(fragments, para_starts, start,
+                                                 available, margin)
+            if page_end <= start:
+                page_end = start + 1        # 单行/单图都放不下时至少前进一个字，避免死循环
+            if page_end >= total:
+                break                       # 本页已经到章末：**不要再加一个等于总长的偏移**，
+                                            # 否则会多出一个 [总长, 总长) 的空白尾页
+            offsets.append(page_end)
+            chars_guess = max(64, int((offsets[-1] - start) * 1.1))
+        self._page_offsets = offsets
+
+    def _last_fitting_offset(self, fragments: List[tuple], para_starts: List[int],
+                             start: int, available: float, margin: float) -> int:
+        """在当前**已渲染页面**上，返回最后一行放得下时的**全章字符偏移**。
+
+        页顶就是 ``documentMargin``（每页都是独立渲染的文档）。
+        注意坐标系：页面文档里的 ``block.position()`` 是**页内坐标**，
+        要按"第几个片段 + 片段在段落里的起点"映射回全章偏移。
+        """
+        document = self.view.document()
+        layout = document.documentLayout()
+        best = start
+        for index, (para_index, frag_start, _frag_end) in enumerate(fragments):
+            block = document.findBlockByNumber(index)
+            if block is None:
+                break
+            # 先量 blockBoundingRect：Qt 布局是按需的，这一步才会算出行坐标
+            rect = layout.blockBoundingRect(block)
             block_layout = block.layout()
             if block_layout is None or not block_layout.lineCount():
                 continue
-            block_rect = layout.blockBoundingRect(block)
-            span = self._block_span(document, layout, block_index)
+            span = self._block_span(document, layout, index)
+            base = para_starts[para_index] + frag_start
+            is_image = block.text() == IMAGE_CHAR
             for line_index in range(block_layout.lineCount()):
                 line = block_layout.lineAt(line_index)
-                advance = self._line_advance(block_layout, line_index, span)
-                bottom = block_rect.top() + line.y() + advance
-                if bottom - page_top > available:
-                    offset = block.position() + line.textStart()
-                    if offset > offsets[-1]:
-                        offsets.append(offset)
-                        page_top = block_rect.top() + line.y()
-        self._page_offsets = offsets
+                # 图片那一行的高度就是图片本身的高度，**不乘行距倍数**
+                advance = self._line_advance(block_layout, line_index, span, is_image)
+                if rect.top() + line.y() + advance - margin > available:
+                    return best
+                best = base + line.textStart() + line.textLength()
+        return best
 
     def _page_size(self) -> int:
         """一屏几页：单页 1，左右双页 2。"""
@@ -1001,13 +1140,44 @@ class ReaderView(QWidget):
     def wheelEvent(self, event) -> None:  # noqa: N802
         # 滚动模式下正常滚动；翻页模式下滚轮也整页跳动，手感更接近翻页
         if self._page_mode:
-            if event.angleDelta().y() < 0:
-                self.next_page()
-            else:
-                self.prev_page()
+            self._turn_from_wheel(event.angleDelta().y(), event.pixelDelta().y())
             event.accept()
             return
         super().wheelEvent(event)
+
+    def _turn_from_wheel(self, delta: int, pixel: int = 0) -> bool:
+        """把滚轮量**按"格"累计**后翻页，返回是否消费了这次事件。
+
+        为什么不能"来一个事件就翻一屏"：滚轮驱动和触摸板经常把**一次滚动
+        拆成多个小事件**（-60 + -60，甚至 -30×4），按事件翻页就会一次跳过
+        好几屏——表现就是"滑一下过去了两页、中间整段内容不见了"（真实踩过，
+        TXT / EPUB 都会）。所以：
+        * 累计到一格（``WHEEL_NOTCH``）才翻**一屏**，多余的当量直接丢掉（绝不连跳）；
+        * 同一格被拆成的连发事件用 ``WHEEL_COOLDOWN`` 抑制，避免重复翻转。
+        """
+        if delta:
+            self._wheel_accum += delta
+            steps = int(self._wheel_accum / WHEEL_NOTCH)
+            self._wheel_accum -= steps * WHEEL_NOTCH
+        elif pixel:
+            self._wheel_pixels += pixel
+            if abs(self._wheel_pixels) < WHEEL_PIXEL_NOTCH:
+                return True                     # 触摸板：攒够一格像素再翻
+            steps = 1 if self._wheel_pixels > 0 else -1
+            self._wheel_pixels = 0
+        else:
+            return True
+        if not steps:
+            return True                         # 还没凑够一格，先攒着
+        now = time.monotonic()
+        if now - self._last_turn < WHEEL_COOLDOWN:
+            return True                         # 同一格的连发事件，只翻一次
+        self._last_turn = now
+        if steps < 0:
+            self.next_page()
+        else:
+            self.prev_page()
+        return True
 
     # ------------------------------------------------------------ 位置记忆
     def _on_scrolled(self, value: int) -> None:

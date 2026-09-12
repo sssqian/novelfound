@@ -138,6 +138,7 @@ class LocalBooks:
             "encoding": data.get("encoding", ""),
             "char_count": int(data.get("char_count") or 0),
             "chapters": data.get("chapters") or [],
+            "images": data.get("images") or [],      # 插图清单（含正文没引用的）
             "added_at": time.time(),
         }
         cover = data.get("cover")

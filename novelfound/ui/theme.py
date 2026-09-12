@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """界面配色与样式表。
 
 设计目标见 `docs/UI设计方案：现代沉浸式小说阅读器.md`：
@@ -282,7 +282,9 @@ def app_stylesheet() -> str:
     QListWidget#paletteResults {{ background: transparent; border: none; }}
     QListWidget#paletteResults::item {{ border-radius: 8px; padding: 0; }}
     QListWidget#paletteResults::item:hover {{ background: {BG_HOVER}; }}
-    QListWidget#paletteResults::item:selected {{ background: {BG_SELECTED}; }}
+    QListWidget#paletteResults::item:selected,
+    QListWidget#paletteResults::item:selected:active,
+    QListWidget#paletteResults::item:selected:!active {{ background: {BG_SELECTED}; }}
     #paletteRow {{ background: transparent; }}
 
     #catalogDrawer {{
@@ -291,6 +293,25 @@ def app_stylesheet() -> str:
     #drawerHeader {{ background: {BG_SURFACE}; }}
     #drawerTitle {{ font-size: 14px; font-weight: 600; color: {TEXT_MAIN}; }}
     QListWidget#drawerList {{ background: {BG_SURFACE}; border: none; }}
+    QTreeWidget#drawerList {{ background: {BG_SURFACE}; border: none; outline: none; }}
+    QTreeWidget#drawerList::item {{ padding: 5px 4px; border-radius: {RADIUS_SM}px; }}
+    QTreeWidget#drawerList::item:hover {{ background: {BG_HOVER}; }}
+    /* 注意要写 :active / :!active 两个变体：焦点在筛选框上时（视图非活动），
+       只写 ::item:selected 会被 Qt 默认的**蓝色**高亮盖掉（视觉验收时发现的）。 */
+    QTreeWidget#drawerList::item:selected,
+    QTreeWidget#drawerList::item:selected:active,
+    QTreeWidget#drawerList::item:selected:!active {{
+        background: {BG_SELECTED}; color: {TEXT_MAIN};
+    }}
+
+    /* 本书插图浏览窗口 */
+    QListWidget#galleryList {{ background: {BG_SURFACE}; border: 1px solid {DIVIDER};
+        border-radius: {RADIUS}px; }}
+    QListWidget#galleryList::item {{ border-radius: {RADIUS_SM}px; color: {TEXT_SUB};
+        font-size: 11px; padding: 4px; }}
+    QListWidget#galleryList::item:selected {{ background: {BG_SELECTED}; color: {TEXT_MAIN}; }}
+    #galleryPreview {{ background: {BG_SURFACE}; border: 1px solid {DIVIDER};
+        border-radius: {RADIUS}px; color: {TEXT_SUB}; }}
 
     #toast {{
         background: rgba(51, 51, 51, 235); color: {BG_SURFACE};

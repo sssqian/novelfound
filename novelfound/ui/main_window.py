@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """主窗口：书架首页 + 书籍详情 + 内置阅读器，外加搜索/目录两个浮层。
 
 P1 信息架构（见 ``docs/UI重构实施方案.md``）：
@@ -46,6 +46,7 @@ from ..tasks import (ChapterTask, CoverTask, DetailTask, LocalImportTask,
 from .book_view import BookView
 from .catalog_drawer import CatalogDrawer
 from .history_panel import HistoryPanel
+from .image_gallery import ImageGalleryDialog
 from .library_view import LibraryView
 from .reader import ReaderView
 from .search_palette import SearchPalette
@@ -194,6 +195,7 @@ class MainWindow(QMainWindow):
         self.catalog_drawer = CatalogDrawer(central)
         self.catalog_drawer.chapter_activated.connect(self.on_catalog_chapter)
         self.catalog_drawer.closed.connect(self._on_drawer_closed)
+        self.catalog_drawer.images_requested.connect(self.open_image_gallery)
 
         self.history_panel = HistoryPanel(self._load_cover, central)
         self.history_panel.entry_chosen.connect(self.on_history_entry)
@@ -300,8 +302,39 @@ class MainWindow(QMainWindow):
         self.history_panel.close_panel()
         self._layout_overlays()          # 先把抽屉摆到最终位置，再从左侧滑入
         self._show_scrim()
-        self.catalog_drawer.open_drawer(detail, index)
+        self.catalog_drawer.open_drawer(detail, index,
+                                        images=self.book_image_count(detail.book))
         self.catalog_drawer.raise_()
+
+    def book_image_count(self, book: Book) -> int:
+        """这本书有多少张插图（只对本地 EPUB 有意义）。"""
+        if not localbooks.is_local_url(book.url):
+            return 0
+        item = self.local_books.get(localbooks.book_id_from_url(book.url))
+        return len((item or {}).get("images") or [])
+
+    def open_image_gallery(self) -> None:
+        """打开「本书插图」：列出 EPUB 包里的所有图片（含正文没引用的）。"""
+        book = self.current_book
+        if book is None or not localbooks.is_local_url(book.url):
+            self.toast.show_message("这本书没有插图可看（只有本地 EPUB 支持）。")
+            return
+        source = self._source_for(book)
+        if source is None or not hasattr(source, "list_images"):
+            self.toast.show_message("本地书源不可用，无法读取插图。")
+            return
+        try:
+            items = source.list_images(book)
+        except Exception as exc:      # noqa: BLE001 - 读清单失败给友好提示
+            self.toast.show_message(f"读取插图清单失败：{exc}", "error")
+            return
+        if not items:
+            self.toast.show_message("这本书里没有图片。")
+            return
+        dialog = ImageGalleryDialog(
+            items, lambda path: source.image_bytes(book, path), self,
+            title=f"《{book.title}》插图")
+        dialog.exec_()
 
     def close_catalog_drawer(self) -> None:
         self.catalog_drawer.close_drawer()

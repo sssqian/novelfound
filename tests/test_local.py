@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from novelfound import localbooks as lb  # noqa: E402
-from novelfound.local_parse import (decode_text, detect_encoding, parse_book,  # noqa: E402
+from novelfound.local_parse import (declared_encoding, decode_text,  # noqa: E402
+                                    detect_encoding, parse_book,
                                     parse_epub, parse_txt, read_chapter,
                                     read_epub_chapter, read_txt_chapter,
                                     split_txt_chapters)
@@ -75,10 +76,28 @@ OPF_XML = """<?xml version="1.0" encoding="utf-8"?>
   <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
 </package>"""
 
-PNG_1PX = bytes.fromhex(
-    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
-    "0000000a49444154789c6360000002000100ffff03000006000557bfabd4000000"
-    "0049454e44ae426082")
+def make_png(width: int = 4, height: int = 4,
+             rgb: tuple = (200, 80, 80)) -> bytes:
+    """生成一张**合法**的小 PNG（不依赖 Pillow）。
+
+    之前手写的那串十六进制 PNG 是坏的（libpng 报 `IDAT: incorrect data check`），
+    字节断言照样通过、真正解码时才失败——所以这里用 zlib + CRC 现场拼一张。
+    """
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (struct.pack(">I", len(data)) + tag + data
+                + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)   # 8bit RGB
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+PNG_1PX = make_png()
 
 
 class LocalTestCase(unittest.TestCase):
@@ -111,8 +130,33 @@ class LocalTestCase(unittest.TestCase):
         return path
 
 
+class TestPngFixture(LocalTestCase):
+    """测试用的 PNG 必须是真能解码的（回归：曾经用了坏图，字节断言照样过）。"""
+
+    def test_generated_png_is_valid(self) -> None:
+        import struct
+
+        data = make_png(3, 2)
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(data[-8:-4], b"IEND")
+        # IHDR 里的宽高
+        width, height = struct.unpack(">II", data[16:24])
+        self.assertEqual((width, height), (3, 2))
+        # CRC 校验（PNG 每个 chunk 都带 CRC）
+        import zlib
+        offset = 8
+        while offset < len(data):
+            length = struct.unpack(">I", data[offset:offset + 4])[0]
+            tag = data[offset + 4:offset + 8]
+            body = data[offset + 8:offset + 8 + length]
+            crc = struct.unpack(">I", data[offset + 8 + length:offset + 12 + length])[0]
+            self.assertEqual(crc, zlib.crc32(tag + body) & 0xFFFFFFFF,
+                             f"{tag!r} chunk 的 CRC 不对")
+            offset += 12 + length
+
+
 class TestEncoding(LocalTestCase):
-    """编码识别。"""
+    """编码识别（含那个把 60% 章节解成乱码的截断误判）。"""
 
     def test_utf8(self) -> None:
         self.assertEqual(detect_encoding("中文内容".encode("utf-8")), "utf-8")
@@ -127,6 +171,58 @@ class TestEncoding(LocalTestCase):
     def test_decode_gbk_roundtrip(self) -> None:
         text, encoding = decode_text("第一章 你好".encode("gbk"))
         self.assertEqual(text, "第一章 你好")
+        self.assertIn(encoding, ("gb18030", "gbk"))
+
+    def test_utf8_not_misdetected_when_prefix_splits_a_char(self) -> None:
+        """回归：中文 UTF-8 在 4KB 处被切断，不能误判成 GBK。
+
+        真实案例：一本 EPUB 的 1408 个 HTML 全部是标准 UTF-8，
+        按"截断前缀 + 严格解码"判断，只有 40% 能通过，其余被当成 GBK → 60% 章节乱码。
+        """
+        body = "这是第一章的正文内容，用于验证编码判定。" * 400      # 远超 4KB
+        raw = body.encode("utf-8")
+        # 先确认前提：4096 处确实把一个汉字切成了两半（老逻辑就是在这里翻车的）
+        split_here = False
+        try:
+            raw[:4096].decode("utf-8")
+        except UnicodeDecodeError:
+            split_here = True
+        self.assertTrue(split_here, "前提：4KB 处应恰好截断一个多字节字符")
+        text, encoding = decode_text(raw)
+        self.assertEqual(encoding, "utf-8")
+        self.assertEqual(text, body)
+
+    def test_all_prefix_lengths_decode_as_utf8(self) -> None:
+        """任意长度前缀（模拟不同文件的截断点）都不能误判成 GBK。"""
+        raw = "诡秘之主第一部小丑第一章绯红。" .encode("utf-8") * 500
+        wrong = []
+        for cut in (4096, 4097, 4098, 8191, 8192):
+            encoding = detect_encoding(raw[:cut])
+            if encoding != "utf-8":
+                wrong.append((cut, encoding))
+        self.assertEqual(wrong, [], f"这些截断点被误判：{wrong}")
+
+    def test_declared_encoding_wins(self) -> None:
+        """文件自己声明了编码就按它解（EPUB 的 HTML 声明 utf-8）。"""
+        raw = '<?xml version="1.0" encoding="gbk"?><p>中文内容测试</p>'.encode("gbk")
+        self.assertEqual(declared_encoding(raw), "gb18030")
+        text, encoding = decode_text(raw, declared_encoding(raw))
+        self.assertEqual(encoding, "gb18030")
+        self.assertIn("中文内容测试", text)
+
+    def test_gbk_file_still_detected_without_declaration(self) -> None:
+        """没有声明时，纯 GBK 文件仍要认出来（别被 utf-8 误收）。"""
+        raw = "第一章 开始\n正文内容全是中文，用于编码测试。\n".encode("gbk") * 200
+        text, encoding = decode_text(raw)
+        self.assertIn(encoding, ("gb18030", "gbk"))
+        self.assertIn("正文内容全是中文", text)
+
+    def test_declared_encoding_ignored_when_invalid(self) -> None:
+        """声明写错了（说 utf-8 其实是 GBK）时，要退回按内容判断。"""
+        raw = "第一章 内容".encode("gbk") * 300
+        declared = "utf-8"                    # 谎报
+        text, encoding = decode_text(raw, declared)
+        self.assertIn("第一章", text)
         self.assertIn(encoding, ("gb18030", "gbk"))
 
 
@@ -166,10 +262,37 @@ class TestTxtChapters(LocalTestCase):
         self.assertTrue(all(c["title"] for c in chapters))
         self.assertEqual(chapters[0]["start"], 0)
 
-    def test_volume_headers_recognised(self) -> None:
-        text = "第一卷 少年\n内容一。\n第二卷 风起\n内容二。\n"
+    def test_volume_headers_become_groups(self) -> None:
+        """`第X卷` 不再算一章，而是给后面的章节打分组。"""
+        text = ("第一卷 少年\n第一章 起点\n正文一，足够长以便通过过滤。\n"
+                "第二章 风起\n正文二，足够长以便通过过滤。\n"
+                "第二卷 归途\n第三章 归来\n正文三，足够长以便通过过滤。\n")
         chapters = split_txt_chapters(text)
-        self.assertEqual([c["title"] for c in chapters], ["第一卷 少年", "第二卷 风起"])
+        self.assertEqual([c["title"] for c in chapters],
+                         ["第一章 起点", "第二章 风起", "第三章 归来"])
+        self.assertEqual([c["group"] for c in chapters],
+                         ["第一卷 少年", "第一卷 少年", "第二卷 归途"])
+
+    def test_volume_intro_is_not_lost(self) -> None:
+        """卷标题后面若有卷首语，要归到下一章（不能丢内容）。"""
+        text = ("第一章 起点\n正文一，足够长以便通过过滤。\n"
+                "第二卷 归途\n这一卷讲他回家的故事，这里是卷首语。\n"
+                "第二章 归来\n正文二，足够长以便通过过滤。\n")
+        chapters = split_txt_chapters(text)
+        self.assertEqual(chapters[1]["group"], "第二卷 归途")
+        paragraphs = read_txt_chapter(text, chapters[1])
+        joined = "".join(paragraphs)
+        self.assertIn("卷首语", joined)
+        self.assertNotIn("第二卷 归途", joined)      # 卷标题行本身不进正文
+
+    def test_group_line_not_in_any_chapter(self) -> None:
+        text = ("第一卷 少年\n第一章 起点\n正文一，足够长以便通过过滤。\n"
+                "第二卷 归途\n第二章 归来\n正文二，足够长以便通过过滤。\n")
+        chapters = split_txt_chapters(text)
+        for chapter in chapters:
+            body = "".join(read_txt_chapter(text, chapter))
+            self.assertNotIn("第二卷 归途", body)
+            self.assertNotIn("第一卷 少年", body)
 
     def test_parse_txt_metadata(self) -> None:
         """文件里写了"书名/作者"就用它，比文件名可靠。"""
@@ -282,6 +405,161 @@ class TestLocalBooks(LocalTestCase):
         path.write_bytes(b"%PDF-1.4")
         with self.assertRaises(ValueError):
             self.make_library().import_file(path)
+
+
+class TestEpubImages(LocalTestCase):
+    """EPUB 插图：正文内嵌图片 + 插图清单。"""
+
+    def write_epub_with_image(self, name: str = "插图版.epub") -> Path:
+        """仿真实 EPUB 的目录结构：正文在 Text/，插图在 Images/，src 用 ../Images/。"""
+        path = self.dir / name
+        opf = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>插图版测试书</dc:title></metadata>
+  <manifest>
+    <item id="c1" href="Text/chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="Text/chap2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="i1" href="Images/C1.png" media-type="image/png"/>
+    <item id="i2" href="Images/未被引用的插图.png" media-type="image/png"/>
+  </manifest>
+  <spine><itemref idref="c1"/><itemref idref="c2"/></spine>
+</package>"""
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("mimetype", "application/epub+zip")
+            archive.writestr("META-INF/container.xml", CONTAINER_XML)
+            archive.writestr("OEBPS/content.opf", opf)
+            archive.writestr("OEBPS/Text/chap1.xhtml", """<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml"><body>
+<div class="imgh"><img alt="alt" src="../Images/C1.png" width="140"/></div>
+<h1>第一章 带图</h1>
+<p>图片下面的正文内容，足够长。</p>
+</body></html>""")
+            archive.writestr("OEBPS/Text/chap2.xhtml", CHAP2_HTML)
+            archive.writestr("OEBPS/Images/C1.png", PNG_1PX)
+            archive.writestr("OEBPS/Images/未被引用的插图.png", PNG_1PX)
+        return path
+
+    def test_inline_image_kept_in_order(self) -> None:
+        """正文里的图片要留在原位置，且整个内容只占 1 个字符（不打乱分页偏移）。"""
+        from novelfound.local_parse import IMAGE_CHAR, read_epub_chapter_rich
+
+        path = self.write_epub_with_image()
+        data = parse_epub(path)
+        paragraphs, images = read_epub_chapter_rich(path, data["chapters"][0])
+        self.assertEqual(list(images.keys()), [0], "图片应插在第一段位置")
+        self.assertEqual(paragraphs[0], IMAGE_CHAR)
+        self.assertEqual(len(paragraphs[0]), 1)
+        self.assertTrue(images[0].startswith(b"\x89PNG"))
+        self.assertTrue(any("图片下面的正文" in p for p in paragraphs))
+        # 位置：图片在标题之前
+        self.assertLess(paragraphs.index(IMAGE_CHAR),
+                        next(i for i, p in enumerate(paragraphs) if "图片下面的正文" in p))
+
+    def test_chapter_without_image_has_empty_images(self) -> None:
+        from novelfound.local_parse import read_epub_chapter_rich
+
+        path = self.write_epub_with_image()
+        data = parse_epub(path)
+        paragraphs, images = read_epub_chapter_rich(path, data["chapters"][1])
+        self.assertEqual(images, {})
+        self.assertTrue(any("EPUB 第二章的正文" in p for p in paragraphs))
+
+    def test_image_list_includes_unreferenced(self) -> None:
+        """插图清单要包含"包里存在但正文没引用"的图（这正是看不到的那批）。"""
+        data = parse_epub(self.write_epub_with_image())
+        names = {item["name"] for item in data["images"]}
+        self.assertIn("C1.png", names)
+        self.assertIn("未被引用的插图.png", names)
+
+    def test_image_list_has_real_sizes(self) -> None:
+        """体积要取 zip 里的真实大小（回归：之前一律显示 0 B）。"""
+        data = parse_epub(self.write_epub_with_image())
+        sizes = {item["name"]: item["size"] for item in data["images"]}
+        self.assertTrue(all(size > 0 for size in sizes.values()), str(sizes))
+
+    def test_source_serves_images(self) -> None:
+        library = LocalBooks(path=self.dir / "b.json", files_dir=self.dir / "f")
+        record = library.import_file(self.write_epub_with_image())
+        source = LocalSource(None, library)
+        book = library.to_book(record)
+        items = source.list_images(book)
+        self.assertGreaterEqual(len(items), 2)
+        data = source.image_bytes(book, items[0]["path"])
+        self.assertTrue(data.startswith(b"\x89PNG"))
+        # 正文里的图要能读出来
+        detail = source.fetch_detail(book)
+        content = source.fetch_chapter(book, detail.chapters[0])
+        self.assertEqual(len(content.images), 1)
+        self.assertEqual(content.paragraphs[list(content.images)[0]], "\ufffc")
+
+    def test_local_source_not_cached(self) -> None:
+        """本地书源标记为不可缓存（插图字节不该进 SQLite）。"""
+        self.assertFalse(getattr(LocalSource, "cacheable", True))
+
+
+class TestEpubToc(LocalTestCase):
+    """EPUB 目录（NCX）：标题与"部/卷"分组。"""
+
+    def write_epub_with_toc(self) -> Path:
+        path = self.dir / "分卷书.epub"
+        ncx = """<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE ncx PUBLIC "-//NISO//DTD ncx 2005-1//EN"
+ "http://www.daisy.org/z3986/2005/ncx-2005-1.dtd">
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+  <head><meta name="dtb:uid" content="x"/></head>
+  <docTitle><text>分卷书</text></docTitle>
+  <navMap>
+    <navPoint id="n1"><navLabel><text>第一部 少年</text></navLabel>
+      <content src="chap1.xhtml"/>
+      <navPoint id="n1-1"><navLabel><text>第一章 起点</text></navLabel>
+        <content src="chap1.xhtml"/></navPoint>
+    </navPoint>
+    <navPoint id="n2"><navLabel><text>第二部 归途</text></navLabel>
+      <content src="chap2.xhtml"/>
+      <navPoint id="n2-1"><navLabel><text>第二章 归来</text></navLabel>
+        <content src="chap2.xhtml"/></navPoint>
+    </navPoint>
+  </navMap>
+</ncx>"""
+        opf = """<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>分卷书</dc:title><dc:creator>某作者</dc:creator></metadata>
+  <manifest>
+    <item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>
+    <item id="c1" href="chap1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="c2" href="chap2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx"><itemref idref="c1"/><itemref idref="c2"/></spine>
+</package>"""
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr("mimetype", "application/epub+zip")
+            archive.writestr("META-INF/container.xml",
+                             CONTAINER_XML.replace("OEBPS/content.opf",
+                                                   "OEBPS/content.opf"))
+            archive.writestr("OEBPS/content.opf", opf)
+            archive.writestr("OEBPS/toc.ncx", ncx)
+            archive.writestr("OEBPS/chap1.xhtml", CHAP1_HTML)
+            archive.writestr("OEBPS/chap2.xhtml", CHAP2_HTML)
+        return path
+
+    def test_titles_come_from_toc(self) -> None:
+        data = parse_epub(self.write_epub_with_toc())
+        self.assertEqual(data["toc_source"], "ncx/nav")
+        self.assertEqual([c["title"] for c in data["chapters"]],
+                         ["第一章 起点", "第二章 归来"])
+
+    def test_groups_from_toc_nesting(self) -> None:
+        data = parse_epub(self.write_epub_with_toc())
+        self.assertEqual([c["group"] for c in data["chapters"]],
+                         ["第一部 少年", "第二部 归途"])
+
+    def test_falls_back_to_html_heading_without_toc(self) -> None:
+        data = parse_epub(self.write_epub())          # 没有 ncx/nav
+        self.assertEqual(data["toc_source"], "")
+        self.assertEqual(data["chapters"][0]["title"], "第一章 开端")
+        self.assertEqual(data["chapters"][0]["group"], "")
 
 
 class TestLocalSource(LocalTestCase):

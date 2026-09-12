@@ -10,12 +10,13 @@
 """
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from typing import List
 
 from .. import localbooks
 from ..localbooks import LocalBooks
-from ..local_parse import read_chapter
+from ..local_parse import read_chapter_rich
 from ..models import Book, BookDetail, Chapter, ChapterContent
 from ..net import NovelError
 from .base import BaseSource
@@ -28,6 +29,7 @@ class LocalSource(BaseSource):
     name = localbooks.SOURCE_NAME
     base_url = ""
     enabled_by_default = True
+    cacheable = False        # 本地内容不写章节缓存（读取很快，且插图字节不该进缓存库）
     note = "读取导入的 TXT / EPUB 文件（不联网）"
 
     def __init__(self, http=None, books: LocalBooks = None, strict: bool = True):
@@ -47,7 +49,8 @@ class LocalSource(BaseSource):
         item = self._item(book)
         chapters = [
             Chapter(title=entry.get("title") or f"第 {index + 1} 章",
-                    url=f"{book.url}/{index}", index=index)
+                    url=f"{book.url}/{index}", index=index,
+                    group=entry.get("group", "") or "")
             for index, entry in enumerate(item.get("chapters") or [])
         ]
         detail = BookDetail(book=book, chapters=chapters)
@@ -71,12 +74,32 @@ class LocalSource(BaseSource):
         if not path.is_file():
             raise NovelError("本地文件已丢失",
                              f"找不到 {path.name}，建议重新导入这本书")
-        paragraphs = read_chapter(path, item, entries[index], strict=self.strict)
+        paragraphs, images = read_chapter_rich(path, item, entries[index],
+                                               strict=self.strict)
         if not paragraphs:
             paragraphs = ["（这一章没有解析出正文）"]
         return ChapterContent(title=chapter.title or entries[index].get("title", ""),
                               paragraphs=paragraphs,
-                              url=chapter.url or f"{book.url}/{index}")
+                              url=chapter.url or f"{book.url}/{index}",
+                              images=images)
+
+    # ------------------------------------------------------------------ 插图
+    def list_images(self, book: Book) -> List[dict]:
+        """这本书里所有插图的清单（含正文没引用的）。"""
+        item = self._item(book)
+        return list(item.get("images") or [])
+
+    def image_bytes(self, book: Book, image_path: str) -> bytes:
+        """按 zip 内路径取一张图（给「本书插图」用）。"""
+        item = self._item(book)
+        path = self.books.file_path(item)
+        if not path.is_file():
+            return b""
+        try:
+            with zipfile.ZipFile(path) as archive:
+                return archive.read(image_path)
+        except (KeyError, OSError, zipfile.BadZipFile):
+            return b""
 
     # ------------------------------------------------------------------ 封面
     def cover_bytes(self, book: Book) -> bytes:

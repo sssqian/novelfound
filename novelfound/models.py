@@ -66,6 +66,7 @@ class Chapter:
     title: str = ""
     url: str = ""
     index: int = 0
+    group: str = ""               # 所属"部/卷"分组（本地书从目录解析，网文一般为空）
 
     @property
     def display_title(self) -> str:
@@ -88,7 +89,12 @@ class BookDetail:
 
 @dataclass
 class ChapterContent:
-    """章节正文（已清洗，纯文本段落）。"""
+    """章节正文（已清洗，纯文本段落）。
+
+    ``images`` 是"内嵌图片"：键是段落序号，值是图片原始字节。
+    对应的段落内容固定是 ``U+FFFC``（对象替换字符，只占 1 个字符），
+    这样分页、进度、位置记忆用的字符偏移完全不受图片影响。
+    """
 
     title: str = ""
     paragraphs: List[str] = field(default_factory=list)
@@ -96,6 +102,7 @@ class ChapterContent:
     prev_url: str = ""
     next_url: str = ""
     from_cache: bool = False
+    images: Dict[int, bytes] = field(default_factory=dict)
 
     @property
     def text(self) -> str:

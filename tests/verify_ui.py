@@ -47,9 +47,9 @@ except AttributeError:  # pragma: no cover
 # 每次自检都从干净状态开始，避免历史配置影响断言
 shutil.rmtree(os.environ["NOVELFOUND_HOME"], ignore_errors=True)
 
-from PyQt5.QtCore import QEvent, QEventLoop, QPoint, Qt  # noqa: E402
+from PyQt5.QtCore import QEvent, QEventLoop, QPoint, QUrl, Qt  # noqa: E402
 from PyQt5.QtGui import (QColor, QFont, QFontDatabase, QImage, QKeyEvent,  # noqa: E402
-                         QMouseEvent, QPainter)
+                         QMouseEvent, QPainter, QTextDocument)
 from PyQt5.QtWidgets import QApplication, QLabel, QPushButton  # noqa: E402
 
 from novelfound.ui.main_window import MainWindow  # noqa: E402
@@ -276,12 +276,11 @@ if ok:
     pump(0.3)
     check("目录抽屉可打开", window.catalog_drawer.is_open(), "")
     check("目录列表已填充",
-          window.catalog_drawer.catalog.count() == len(detail.chapters),
-          f"{window.catalog_drawer.catalog.count()} / {len(detail.chapters)}")
+          window.catalog_drawer.chapter_count() == len(detail.chapters),
+          f"{window.catalog_drawer.chapter_count()} / {len(detail.chapters)}")
     window.catalog_drawer.filter_box.setText("第一章")
     pump(0.3)
-    visible = sum(1 for i in range(window.catalog_drawer.catalog.count())
-                  if not window.catalog_drawer.catalog.item(i).isHidden())
+    visible = window.catalog_drawer.visible_chapter_count()
     check("目录筛选生效", 0 < visible < len(detail.chapters), f"可见 {visible} 条")
     window.catalog_drawer.filter_box.clear()
     pump(0.2)
@@ -352,14 +351,14 @@ if ok:
         pump(0.4)
         check("阅读器可打开目录抽屉", window.catalog_drawer.is_open(), "")
         check("抽屉高亮当前阅读章",
-              window.catalog_drawer.catalog.currentRow() ==
+              window.catalog_drawer.current_chapter_index() ==
               window.reader.chapter_index,
-              f"row={window.catalog_drawer.catalog.currentRow()} "
+              f"当前={window.catalog_drawer.current_chapter_index()} "
               f"index={window.reader.chapter_index}")
+        _current_item = window.catalog_drawer.chapter_item(window.reader.chapter_index)
         check("抽屉当前章有 ▶ 标记",
-              window.catalog_drawer.catalog.item(
-                  window.catalog_drawer.catalog.currentRow()).text().startswith("▶"),
-              "")
+              _current_item is not None and _current_item.text(0).startswith("▶"),
+              _current_item.text(0) if _current_item is not None else "无")
         window.close_catalog_drawer()
         pump(0.5)                       # 等 200ms 淡出动画跑完
         check("关闭抽屉后遮罩隐藏", not window.scrim.isVisible(), "")
@@ -486,8 +485,8 @@ if ok:
               f"后续页段数={page_sizes[1:7]}")
 
         # ---- 行级分页的结构性保证：所有页都不溢出，且每页都装满 ----
-        # 溢出回归的根因：Qt 比例行距下 line.height() 只是文字高度，
-        # 真实行步进要乘行距倍数（30 × 1.9 = 57），漏乘就会一页多塞两三行。
+        # 注意：这里的"溢出"用的是 document().size()，只是个辅助信号（比例行距下
+        # 这个高度本身不准、还可能滞后）；**权威判据是下面那段像素级检查**。
         overflow = []
         fills = []
         doc_margin = window.reader.view.document().documentMargin()
@@ -503,9 +502,11 @@ if ok:
                 overflow.append(i)
             fills.append((height - 2 * doc_margin) / max(1.0, usable))
         check("所有页均不溢出（行级分页）", not overflow, f"溢出页={overflow}")
-        # 最后一页是本章剩余内容，天然不满，只校验前面各页
+        # 最后一页是本章剩余内容，天然不满，只校验前面各页。
+        # 门槛 0.75：分页现在对"每块最后一行"用偏保守的行距模型（宁可少放一行，
+        # 也不让底部被裁），填充率会比理论极限低一点，这是有意的取舍。
         body_fills = fills[:-1] or fills
-        check("每页都装满（不是只塞一行）", min(body_fills) >= 0.8,
+        check("每页都装满（不是只塞一行）", min(body_fills) >= 0.75,
               f"最低填充率={min(body_fills):.3f} "
               f"页号={body_fills.index(min(body_fills))}")
         window.reader._show_spread(0)
@@ -558,6 +559,14 @@ if ok:
 
         # ---- 滚轮在正文上也应整屏翻页 ----
         from PyQt5.QtGui import QWheelEvent  # noqa: E402
+
+        def _send_wheel(angle: int) -> None:
+            wheel_viewport = window.reader.view.viewport()
+            wheel_point = QPoint(wheel_viewport.width() // 2, wheel_viewport.height() // 2)
+            app.sendEvent(wheel_viewport, QWheelEvent(
+                wheel_point, wheel_viewport.mapToGlobal(wheel_point), QPoint(0, 0),
+                QPoint(0, angle), Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False))
+
         spread_before = window.reader._spread
         viewport = window.reader.view.viewport()
         point = QPoint(viewport.width() // 2, viewport.height() // 2)
@@ -569,6 +578,117 @@ if ok:
         check("滚轮在正文上翻页", window.reader._spread == spread_before + 1,
               f"{spread_before} -> {window.reader._spread} "
               f"（屏数 {window.reader.spread_count()}）")
+
+        # ---- 回归：一次物理滚动只翻一屏 ----
+        # 滚轮驱动/触摸板会把一格拆成多个小事件（-60+-60、-30x4），
+        # 按事件翻页就会一次跳好几屏、中间内容整段丢失（用户实测反馈）。
+        window.reader._show_spread(0)
+        window.reader._wheel_accum = 0
+        window.reader._last_turn = 0.0
+        pump(0.2)
+        before = window.reader._spread
+        for _ in range(2):
+            _send_wheel(-60)
+            pump(0.05)
+        pump(0.3)
+        check("一格被拆成两个事件也只翻一屏", window.reader._spread == before + 1,
+              f"{before} -> {window.reader._spread}")
+        window.reader._wheel_accum = 0
+        window.reader._last_turn = 0.0
+        before = window.reader._spread
+        for _ in range(4):
+            _send_wheel(-30)
+            pump(0.04)
+        pump(0.3)
+        check("一格被拆成四个事件也只翻一屏", window.reader._spread == before + 1,
+              f"{before} -> {window.reader._spread}")
+
+        # ---- 回归：逐屏翻完不能丢内容 ----
+        window.reader._show_spread(0)
+        pump(0.2)
+        pieces = []
+        for _ in range(window.reader.spread_count()):
+            pieces.append(window.reader.view.toPlainText())
+            if window.reader._two_page:
+                pieces.append(window.reader.view2.toPlainText())
+            window.reader.next_page()
+            pump(0.12)
+        walked = "".join("".join(pieces).split())
+        original = "".join("".join(window.reader._paragraphs).split())
+        check("逐屏翻完全程不丢内容", walked == original,
+              f"收集 {len(walked)} 字 / 原文 {len(original)} 字")
+
+        # ---- 翻页模式下没有一页比视口高（否则滚轮会先去滚视口）----
+        too_tall = []
+        for spread_index in range(window.reader.spread_count()):
+            window.reader._show_spread(spread_index)
+            pump(0.06)
+            for side, view in (("左", window.reader.view), ("右", window.reader.view2)):
+                if not view.isVisible():
+                    continue
+                if view.document().size().height() > view.viewport().height() + 2:
+                    too_tall.append((spread_index, side))
+        check("翻页模式没有溢出的页", not too_tall,
+              f"{len(too_tall)} 页溢出：{too_tall[:4]}")
+
+        # ---- 像素级：每一页的文字都不能贴着/超出底边（真·裁切检测）----
+        # 之前用 document().size() 判断"没溢出"是循环验证——分页和自检用了同一个
+        # 高度模型，所以一直是绿的，而实际渲染把底部几行裁掉了。这里改数像素。
+        # 注意要抓**稳定帧**：刚翻页时 grab() 可能抓到上一帧，会误报"贴底"。
+        def stable_grab(widget):
+            previous = None
+            image = None
+            for _ in range(8):
+                image = widget.viewport().grab().toImage()
+                data = bytes(image.bits().asstring(image.byteCount()))
+                if previous == data:
+                    return image
+                previous = data
+                pump(0.12)
+            return image
+
+        clipped = []
+        page_widths = set()
+        scrollbars_on = []
+        for spread_index in range(window.reader.spread_count()):
+            window.reader._show_spread(spread_index)
+            pump(0.2)
+            for side, view in (("左", window.reader.view), ("右", window.reader.view2)):
+                if not view.isVisible():
+                    continue
+                page_widths.add(view.viewport().width())
+                if view.verticalScrollBarPolicy() != Qt.ScrollBarAlwaysOff:
+                    scrollbars_on.append((spread_index, side))
+                page_image = stable_grab(view)
+                width, height = page_image.width(), page_image.height()
+                if width < 8 or height < 8:
+                    continue
+                background = page_image.pixelColor(2, 2)
+                lowest = 0
+                for y in range(height - 3, 2, -1):
+                    hits = 0
+                    for x in range(4, width - 4, 3):
+                        color = page_image.pixelColor(x, y)
+                        if (abs(color.red() - background.red())
+                                + abs(color.green() - background.green())
+                                + abs(color.blue() - background.blue())) > 36:
+                            hits += 1
+                    if hits >= 4:          # 成行的文字才算，单像素噪点不算
+                        lowest = y
+                        break
+                if lowest and height - lowest < 6:
+                    clipped.append((spread_index, side, lowest, height))
+        check("每页底部都留有余量（文字没被裁掉）", not clipped,
+              f"{len(clipped)} 页贴底：{clipped[:4]}")
+        # 翻页模式下滚动条必须始终关闭：早先"溢出就打开滚动条"做兜底，
+        # 结果滚动条挤窄视口 → 文字重排更多行 → 更溢出 → 滚动条粘住，
+        # 而分页是按没有滚动条的宽度算的 → 底部被裁、内容看着像丢了一段。
+        check("翻页模式视口宽度恒定（不会越翻越窄）", len(page_widths) == 1,
+              f"出现过的宽度={sorted(page_widths)}")
+        check("翻页模式不显示滚动条", not scrollbars_on,
+              f"{len(scrollbars_on)} 页开了滚动条：{scrollbars_on[:4]}")
+        window.reader._show_spread(0)
+        pump(0.2)
 
         # 翻一屏：左右两页都往前走
         before_spread = window.reader._spread
@@ -986,11 +1106,31 @@ _local_dir.mkdir(parents=True, exist_ok=True)
 _txt_path = _local_dir / "本地测试书.txt"
 _txt_path.write_text(
     "书名：本地测试书\n作者：测试作者\n\n"
+    "第一部 开端\n"
     "第一章 开端\n" + "第一段正文内容，用于本地导入自检。" * 8 + "\n"
+    "第二部 继续\n"
     "第二章 继续\n" + "第二段正文内容，用于本地导入自检。" * 8 + "\n",
     encoding="utf-8")
 
 _epub_path = _local_dir / "本地EPUB.epub"
+# 仿真实 EPUB 的目录结构：正文在 Text/、插图在 Images/，src 用相对路径 ../Images/
+# PNG 用 zlib + CRC 现场生成（手写十六进制那张是坏的：能过字节断言、解码时报错）
+def _make_png(width: int = 4, height: int = 4, rgb: tuple = (200, 80, 80)) -> bytes:
+    import struct as _struct
+    import zlib as _zlib
+
+    raw = b"".join(b"\x00" + bytes(rgb) * width for _ in range(height))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (_struct.pack(">I", len(data)) + tag + data
+                + _struct.pack(">I", _zlib.crc32(tag + data) & 0xFFFFFFFF))
+
+    ihdr = _struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
+            + chunk(b"IDAT", _zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
+_PNG_1PX = _make_png(400, 300)      # 图要够大：小图看不出"被行距放大"的空白
 with _zipfile.ZipFile(_epub_path, "w") as _archive:
     _archive.writestr("mimetype", "application/epub+zip")
     _archive.writestr("META-INF/container.xml",
@@ -1005,12 +1145,20 @@ with _zipfile.ZipFile(_epub_path, "w") as _archive:
                       'xmlns:dc="http://purl.org/dc/elements/1.1/">'
                       '<dc:title>本地 EPUB 测试书</dc:title>'
                       '<dc:creator>EPUB 作者</dc:creator></metadata><manifest>'
-                      '<item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/>'
+                      '<item id="c1" href="Text/c1.xhtml" '
+                      'media-type="application/xhtml+xml"/>'
+                      '<item id="i1" href="Images/C1.png" media-type="image/png"/>'
+                      '<item id="i2" href="Images/未引用插图.png" media-type="image/png"/>'
                       '</manifest><spine><itemref idref="c1"/></spine></package>')
-    _archive.writestr("OEBPS/c1.xhtml",
+    _archive.writestr("OEBPS/Text/c1.xhtml",
                       '<?xml version="1.0" encoding="utf-8"?><html '
-                      'xmlns="http://www.w3.org/1999/xhtml"><body><h1>第一章 EPUB</h1>'
+                      'xmlns="http://www.w3.org/1999/xhtml"><body>'
+                      '<div class="imgh"><img alt="alt" src="../Images/C1.png" '
+                      'width="140"/></div>'
+                      '<h1>第一章 EPUB</h1>'
                       '<p>EPUB 正文内容，用于本地导入自检。</p></body></html>')
+    _archive.writestr("OEBPS/Images/C1.png", _PNG_1PX)
+    _archive.writestr("OEBPS/Images/未引用插图.png", _PNG_1PX)
 
 window.import_local_books([str(_txt_path), str(_epub_path)])
 # 注意：等的是"真的进了书架"，不能只等 local_books.count()——那个在导入循环里就会变，
@@ -1069,7 +1217,189 @@ if ok:
     window.on_read_requested(window.current_detail, 0)
     ok = wait_for(lambda: "EPUB 正文内容" in "".join(window.reader._paragraphs), 40)
     check("EPUB 能读正文", ok, f"{len(window.reader._paragraphs)} 段")
+    # 正文内嵌插图：解析出图片字节，并且真的画进了文档
+    check("EPUB 内嵌插图已解析", len(window.reader._images) >= 1,
+          f"{len(window.reader._images)} 张")
+    _html = window.reader.view.document().toHtml()
+    check("EPUB 插图已画进正文", "<img" in _html.lower(), f"HTML 长度={len(_html)}")
+    # 关键：图片要**注册成文档资源**，否则 Qt 画的是"图片缺失"的破图图标
+    # （只断言 "<img" 是不够的——破图也满足它，真实踩过）
+    _doc = window.reader.view.document()
+    _registered = [index for index in window.reader._images
+                   if not _doc.resource(
+                       QTextDocument.ImageResource,
+                       QUrl(window.reader._image_key(index))).isNull()]
+    check("EPUB 插图已注册为文档资源", len(_registered) == len(window.reader._images),
+          f"已注册 {len(_registered)}/{len(window.reader._images)}")
+
+    # ---- 回归：插图那一行不能被"比例行距"放大 ----
+    # 图片那"一行"的 line.height() 就是图片高度；若按行距 190% 算，
+    # 600px 的插图会变成 1140px → 图片下方凭空多出 540px 空白，分页还会以为它
+    # 放不下、把它挤到单独一页（表现："图标跑到右栏、左栏下半截空着"）。
+    _doc_layout = _doc.documentLayout()
+    _image_gap = None
+    for _i in range(_doc.blockCount()):
+        _block = _doc.findBlockByNumber(_i)
+        if _block.text() == "\ufffc" and _i + 1 < _doc.blockCount():
+            _rect = _doc_layout.blockBoundingRect(_block)
+            _next_rect = _doc_layout.blockBoundingRect(_doc.findBlockByNumber(_i + 1))
+            _image_gap = _next_rect.top() - (_rect.top() + _rect.height())
+            break
+    check("插图下方没有多余空白（未被行距放大）",
+          _image_gap is not None and _image_gap <= 40,
+          f"间隙={_image_gap if _image_gap is not None else '未找到图片块'}px")
+
+    # ---- 回归：章末不能多出一个空白尾页 ----
+    # 分页最后一页的起点若等于整章长度，那一页就是空的（用户实测看到空白页）。
+    # 这里需要翻页模式（滚动模式下没有页的概念），测完切回滚动模式，
+    # 免得影响后面依赖滚动模式的断言。
+    window.reader.settings_popover.mode_button.setChecked(True)
+    pump(0.8)
+    check("章末没有空白尾页",
+          bool(window.reader._page_offsets)
+          and window.reader._text_length > window.reader._page_offsets[-1],
+          f"末页起点={window.reader._page_offsets[-1] if window.reader._page_offsets else '无'} "
+          f"文本长={window.reader._text_length}")
+    window.reader._show_spread(window.reader.spread_count() - 1)
+    pump(0.3)
+    _last = window.reader.view.toPlainText()
+    if window.reader._two_page:
+        _last += window.reader.view2.toPlainText()
+    check("最后一屏有内容", bool(_last.strip()), f"{len(_last.strip())} 字")
+    window.reader._show_spread(0)
+    pump(0.2)
+    shot("21_epub_with_image")
+    window.reader.settings_popover.mode_button.setChecked(False)
+    pump(0.6)
     window.on_reader_back()
+    pump(0.4)
+
+# ---- 本书插图：清单 + 浏览窗口 + 抽屉入口 ----
+_epub_src = window._source_for(_local_epub_book)
+_items = _epub_src.list_images(_local_epub_book) if _epub_src else []
+check("插图清单包含正文没引用的图", len(_items) >= 2,
+      f"{len(_items)} 张：{[i['name'] for i in _items]}")
+if _items:
+    from novelfound.ui.image_gallery import ImageGalleryDialog  # noqa: E402
+
+    _gallery = ImageGalleryDialog(
+        _items, lambda path: _epub_src.image_bytes(_local_epub_book, path),
+        window, title="《本地 EPUB 测试书》插图")
+    _gallery.resize(880, 620)
+    _gallery.show()
+    pump(0.4)
+    check("插图窗口列出全部图片",
+          len(_gallery.image_paths()) == len(_items), f"{len(_gallery.image_paths())} 张")
+    _size = _gallery.current_image_size()
+    check("插图窗口能显示图片", _size[0] > 0 and _size[1] > 0, f"{_size[0]}x{_size[1]}")
+    check("插图窗口可另存", _gallery.save_button.isEnabled(), "")
+    _gallery.grab().save(str(OUT / "20_image_gallery.png"))
+    _gallery.close()
+
+window.on_book_clicked(_local_epub_book)
+wait_for(lambda: window.current_detail is not None
+         and window.current_detail.book.key == _local_epub_book.key, 40)
+window.open_catalog_drawer()
+pump(0.4)
+check("目录抽屉有「本书插图（N）」入口",
+      window.catalog_drawer.images_button.isVisible()
+      and str(len(_items)) in window.catalog_drawer.images_button.text(),
+      window.catalog_drawer.images_button.text())
+window.close_catalog_drawer()
+pump(0.3)
+
+# ---- 超大插图必须缩到页面内（章首大图不能占满整页）----
+from novelfound.models import ChapterContent  # noqa: E402
+
+window.reader.set_content(ChapterContent(
+    title="大图测试",
+    paragraphs=["\ufffc", "正文内容，用于验证插图缩放与居中。"],
+    images={0: _make_png(1600, 1200)}), index=0)
+pump(0.8)
+_doc = window.reader.view.document()
+_doc_layout = _doc.documentLayout()
+_viewport_h = window.reader.view.viewport().height()
+_image_h = 0.0
+_image_centered = False
+for _i in range(_doc.blockCount()):
+    _block = _doc.findBlockByNumber(_i)
+    if _block.text() == "\ufffc":
+        _image_h = _doc_layout.blockBoundingRect(_block).height()
+        _image_centered = bool(_block.blockFormat().alignment() & Qt.AlignHCenter)
+        break
+check("超大插图缩到页面内",
+      0 < _image_h <= _viewport_h * 0.62 + 2,
+      f"高={_image_h:.0f} 上限={_viewport_h * 0.62:.0f}")
+check("插图居中显示", _image_centered, "")
+
+# ------------------------------------------------- 5g. 本地书的「部/卷」分组目录
+window.on_book_clicked(window.local_books.to_book(_lb_txt))
+ok = wait_for(lambda: window.current_detail is not None
+              and window.current_detail.book.key == _local_book.key, 40)
+if ok:
+    _detail = window.current_detail
+    _groups = [c.group for c in _detail.chapters if c.group]
+    check("本地书章节带分组信息", bool(set(_groups)),
+          f"{len(set(_groups))} 组：{sorted(set(_groups))}")
+    window.open_catalog_drawer()
+    pump(0.4)
+    check("目录里出现分组节点",
+          set(window.catalog_drawer.group_titles()) == set(_groups),
+          str(window.catalog_drawer.group_titles()))
+    _current = window.catalog_drawer.current_chapter_index()
+    _current_group = (_detail.chapters[_current].group
+                      if 0 <= _current < len(_detail.chapters) else "")
+    _expanded = [g for g in window.catalog_drawer.group_titles()
+                 if window.catalog_drawer.is_group_expanded(g)]
+    check("默认只展开当前章所在的分组",
+          _expanded == ([_current_group] if _current_group else []),
+          f"展开={_expanded} 当前章所在组={_current_group!r}")
+    _first = window.catalog_drawer.group_titles()[0] if _groups else ""
+    if not _groups:
+        check("目录分组断言可继续（需先有分组）", False, "这本书没有分组，后续断言跳过")
+    else:
+        window.catalog_drawer.toggle_all_groups()
+        pump(0.2)
+        check("可一键展开全部分组",
+              all(window.catalog_drawer.is_group_expanded(g)
+                  for g in window.catalog_drawer.group_titles()), "")
+        window.catalog_drawer.toggle_all_groups()
+        pump(0.2)
+        check("可一键收起全部分组",
+              not any(window.catalog_drawer.is_group_expanded(g)
+                      for g in window.catalog_drawer.group_titles()), "")
+        window.catalog_drawer._on_item_activated(
+            window.catalog_drawer.group_item(_first))      # 点组标题
+        pump(0.2)
+        check("点分组标题可展开", window.catalog_drawer.is_group_expanded(_first), "")
+        window.catalog_drawer._on_item_activated(
+            window.catalog_drawer.group_item(_first))
+        pump(0.2)
+        check("再点分组标题可收起",
+              not window.catalog_drawer.is_group_expanded(_first), "")
+        window.catalog_drawer.filter_box.setText("第二章")
+        pump(0.3)
+        _visible = window.catalog_drawer.visible_chapter_count()
+        _matched = next((c.group for c in _detail.chapters
+                         if "第二章" in c.display_title), "")
+        _others_hidden = all(
+            window.catalog_drawer.group_item(g).isHidden()
+            for g in window.catalog_drawer.group_titles() if g != _matched)
+        check("筛选时展开命中的分组、隐藏没命中的",
+              0 < _visible < len(_detail.chapters)
+              and window.catalog_drawer.is_group_expanded(_matched)
+              and _others_hidden,
+              f"可见={_visible}/{len(_detail.chapters)} 命中组={_matched!r} "
+              f"其它组全隐藏={_others_hidden}")
+        window.catalog_drawer.filter_box.clear()
+        pump(0.2)
+        _expanded_after = [g for g in window.catalog_drawer.group_titles()
+                           if window.catalog_drawer.is_group_expanded(g)]
+        check("清空筛选后回到默认收起",
+              _expanded_after == ([_current_group] if _current_group else []),
+              f"展开={_expanded_after}")
+    shot("19_catalog_groups")
+    window.close_catalog_drawer()
     pump(0.4)
 
 # 搜索里也能搜到本地书

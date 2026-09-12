@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """离屏窗口脚手架：省掉每个一次性验证脚本的 40 行样板。
 
 用法（**必须先 import harness，再 import novelfound**，因为环境变量要在
@@ -14,8 +14,11 @@ Qt/配置模块导入前设好）：
     pump(app, 0.4)
 
 约定：
-* 数据目录默认 `tests/.smoke`（每次 make_app(clean=True) 清空），
-  不会碰到用户真实书架；
+* 数据目录默认 `tests/.testdata/smoke`（每次 `make_app(clean=True)` 清空），
+  不会碰到用户真实书架。放在 `.testdata/` 下是因为 `.gitignore` 已忽略它、
+  且 `verify.py` 不会清（`tests/.tmp` 每轮都会被清掉，不适合放样本）。
+* 要拿用户真实的书做验证：复制到 `tests/.testdata/books/`，再把
+  `NOVELFOUND_HOME` 指过去（沙箱写不了 `%APPDATA%`）。见 `scripts/sweep.py`。
 * 需要真实显示器时把 QT_QPA_PLATFORM 设为空字符串再调用 make_app()。
 """
 from __future__ import annotations
@@ -41,7 +44,7 @@ if str(ROOT) not in sys.path:
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
-os.environ.setdefault("NOVELFOUND_HOME", str(ROOT / "tests" / ".smoke"))
+os.environ.setdefault("NOVELFOUND_HOME", str(ROOT / "tests" / ".testdata" / "smoke"))
 
 # 离屏平台默认不加载字体 → 界面上的文字全都画不出来（截图里只有色块和图片）。
 # 必须在 QApplication 创建之前指定系统字体目录，Qt 的 basic font database 才会扫描。

@@ -197,7 +197,10 @@ class ChapterTask(BaseTask):
         self.stats = stats
 
     def work(self) -> ChapterContent:
-        if self.cache is not None and not self.force:
+        # 本地书不缓存：① 读本地本来就快；② 内嵌插图的字节不该塞进缓存库
+        # （同一张图可能被上千章引用，会白白撑大 cache.db）。
+        cacheable = getattr(self.source, "cacheable", True)
+        if self.cache is not None and cacheable and not self.force:
             cached = self.cache.get_chapter(self.source.key, self.book.url,
                                             self.chapter.url)
             if cached:
@@ -218,7 +221,7 @@ class ChapterTask(BaseTask):
             self.stats.record(self.source.key, ok=True, elapsed=time.time() - started)
         if not content.title:
             content.title = self.chapter.title
-        if self.cache is not None and content.paragraphs:
+        if self.cache is not None and cacheable and content.paragraphs:
             self.cache.put_chapter(self.source.key, self.book.url, self.chapter.url,
                                    content.title, content.paragraphs)
         return content
@@ -414,7 +417,8 @@ def _detail_to_cache(detail: BookDetail) -> dict:
             "latest_chapter": book.latest_chapter, "updated_at": book.updated_at,
             "word_count": book.word_count, "extra": book.extra,
         },
-        "chapters": [{"title": c.title, "url": c.url, "index": c.index}
+        "chapters": [{"title": c.title, "url": c.url, "index": c.index,
+                      "group": c.group}
                      for c in detail.chapters],
     }
 
@@ -438,6 +442,7 @@ def _detail_from_cache(payload: dict, fallback: Book,
         extra=data.get("extra") or {},
     )
     chapters = [Chapter(title=c.get("title", ""), url=c.get("url", ""),
-                        index=int(c.get("index", i)))
+                        index=int(c.get("index", i)),
+                        group=c.get("group", "") or "")
                 for i, c in enumerate(payload.get("chapters") or [])]
     return BookDetail(book=book, chapters=chapters)
