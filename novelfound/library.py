@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """书架与阅读进度（JSON 持久化）。
 
 保存的内容：
@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import data_dir
+from . import localbooks
 from .models import Book, BookDetail
 from .storage import atomic_write_json
 
@@ -176,6 +177,41 @@ class Library:
         items = list(self._data["history"].values())
         items.sort(key=lambda i: i.get("last_read_at") or 0, reverse=True)
         return [i for i in items if i.get("last_chapter_url")]
+
+    # ------------------------------------------------------- 删除 / 清理
+    def forget(self, key: str) -> bool:
+        """彻底忘掉一本书：书架条目 + 阅读进度 + 最近列表。
+
+        「移出书架」（:meth:`remove`）只是从书架隐藏；要连进度一起清就用这个。
+        """
+        with self._lock:
+            removed = False
+            if self._data["books"].pop(key, None) is not None:
+                removed = True
+            if self._data["history"].pop(key, None) is not None:
+                removed = True
+            self._data["recent"] = [k for k in self._data["recent"] if k != key]
+        self.save()
+        return removed
+
+    def stale_local_keys(self, valid_ids) -> List[str]:
+        """指向"已不存在的本地书"的记录键（清理失效记录用）。"""
+        valid = {f"local|{localbooks.local_url(i)}" for i in valid_ids}
+        keys = set(self._data["books"]) | set(self._data["history"]) | set(self._data["recent"])
+        return sorted(k for k in keys if localbooks.is_local_key(k) and k not in valid)
+
+    def purge_stale_local(self, valid_ids) -> int:
+        """清掉指向已不存在本地书的书架/进度/最近记录，返回清掉几条。"""
+        stale = self.stale_local_keys(valid_ids)
+        with self._lock:
+            for key in stale:
+                self._data["books"].pop(key, None)
+                self._data["history"].pop(key, None)
+            self._data["recent"] = [k for k in self._data["recent"]
+                                    if k not in set(stale)]
+        if stale:
+            self.save()
+        return len(stale)
 
 
 def _book_fields(book: Book) -> Dict[str, Any]:

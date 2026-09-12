@@ -313,6 +313,11 @@ def app_stylesheet() -> str:
     #galleryPreview {{ background: {BG_SURFACE}; border: 1px solid {DIVIDER};
         border-radius: {RADIUS}px; color: {TEXT_SUB}; }}
 
+    /* 危险操作按钮（删除本地书） */
+    QPushButton#danger {{ color: #B23A2E; border: 1px solid #E3B7B0;
+        background: {BG_SURFACE}; padding: 6px 14px; border-radius: {RADIUS_SM}px; }}
+    QPushButton#danger:hover {{ background: #FBEDEA; }}
+
     #toast {{
         background: rgba(51, 51, 51, 235); color: {BG_SURFACE};
         border-radius: {RADIUS}px; padding: 10px 14px;

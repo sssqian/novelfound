@@ -201,6 +201,67 @@ class Cache:
                 pass
 
     # ------------------------------------------------------------------- 维护
+    def count_for_book(self, source: str, book_url: str) -> int:
+        """这本书在缓存里有多少行（章节 + 详情），删除前给用户看明细用。"""
+        if not self.available or not book_url:
+            return 0
+        with self._lock:
+            total = 0
+            for table in ("chapter", "detail"):
+                try:
+                    total += self._conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE source=? AND book_url=?",
+                        (source, book_url)).fetchone()[0]
+                except sqlite3.Error:
+                    pass
+        return total
+
+    def delete_book(self, source: str, book_url: str) -> int:
+        """删掉某本书的章节与详情缓存，返回删掉的行数（封面按 URL 单独管）。"""
+        if not self.available or not book_url:
+            return 0
+        removed = 0
+        with self._lock:
+            for table in ("chapter", "detail"):
+                try:
+                    cur = self._conn.execute(
+                        f"DELETE FROM {table} WHERE source=? AND book_url=?",
+                        (source, book_url))
+                    removed += cur.rowcount or 0
+                except sqlite3.Error:
+                    pass
+            try:
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+        return removed
+
+    def purge_stale_local(self, valid_urls) -> int:
+        """清掉指向"已不存在的本地书"的缓存行，返回清掉的行数。"""
+        if not self.available:
+            return 0
+        valid = set(valid_urls)
+        removed = 0
+        with self._lock:
+            for table in ("chapter", "detail"):
+                try:
+                    rows = self._conn.execute(
+                        f"SELECT book_url FROM {table} WHERE source='local'").fetchall()
+                    for (book_url,) in rows:
+                        if book_url in valid:
+                            continue
+                        cur = self._conn.execute(
+                            f"DELETE FROM {table} WHERE source='local' AND book_url=?",
+                            (book_url,))
+                        removed += cur.rowcount or 0
+                except sqlite3.Error:
+                    pass
+            try:
+                self._conn.commit()
+            except sqlite3.Error:
+                pass
+        return removed
+
     def stats(self) -> Dict[str, Any]:
         if not self.available:
             return {"available": False, "chapters": 0, "books": 0, "covers": 0, "size": 0}

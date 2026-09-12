@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """书架首页（启动首屏）。
 
 只有一屏**书架封面网格**：每格 = 封面 + 书名 + 进度文字。
@@ -18,6 +18,7 @@ from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (QFrame, QGridLayout, QHBoxLayout, QPushButton,
                              QScrollArea, QVBoxLayout, QWidget)
 
+from .. import localbooks
 from ..models import Book
 from .widgets import CoverTile, EmptyState, SectionTitle
 
@@ -43,6 +44,10 @@ class LibraryView(QWidget):
     book_opened = pyqtSignal(object)          # Book：打开详情
     search_requested = pyqtSignal()           # 空状态里的「搜索小说」
     import_requested = pyqtSignal()           # 「导入 TXT / EPUB」按钮
+    manage_requested = pyqtSignal()           # 「本地书管理」按钮
+    shelf_remove_requested = pyqtSignal(object)   # 右键菜单：移出书架
+    local_delete_requested = pyqtSignal(object)   # 右键菜单：删除本地书
+    reveal_requested = pyqtSignal(object)         # 右键菜单：打开文件位置
 
     def __init__(self, config, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -80,12 +85,17 @@ class LibraryView(QWidget):
         self.scroll.setWidget(self.container)
         root.addWidget(self.scroll, 1)
 
-        # 书架标题行：标题 + 「导入本地书籍」按钮（也支持把文件拖到窗口里）
+        # 书架标题行：标题 + 「本地书管理」+「导入本地书籍」（也支持把文件拖到窗口里）
         head = QHBoxLayout()
         head.setSpacing(10)
         self.shelf_title = SectionTitle("我的书架", self.container)
         head.addWidget(self.shelf_title)
         head.addStretch(1)
+        self.manage_button = QPushButton("本地书管理", self.container)
+        self.manage_button.setObjectName("link")
+        self.manage_button.setToolTip("查看、删除已导入的本地书，清理失效记录")
+        self.manage_button.clicked.connect(self.manage_requested.emit)
+        head.addWidget(self.manage_button)
         self.import_button = QPushButton("＋ 导入 TXT / EPUB", self.container)
         self.import_button.setToolTip("把本地的 TXT / EPUB 电子书导入书架（也可以直接拖文件到窗口）")
         self.import_button.clicked.connect(self.import_requested.emit)
@@ -120,11 +130,27 @@ class LibraryView(QWidget):
             tile = CoverTile(book, progress_text(record, library.progress(book.key)),
                              parent=self.container)
             tile.clicked.connect(self.book_opened.emit)
+            # 右键菜单：移出书架 / 删除本地书 / 打开文件位置（本地导入的书才有后两项）
+            tile.setContextMenuPolicy(Qt.CustomContextMenu)
+            tile.customContextMenuRequested.connect(
+                lambda _pos, b=book, t=tile: self._show_tile_menu(b, t))
             self._tiles.append(tile)
             if book.cover_url and self._cover_loader:
                 self._cover_loader(book.cover_url, tile.set_cover, tile.cover)
         self._columns = 0
         self._relayout_grid()
+
+    def _show_tile_menu(self, book: Book, tile) -> None:
+        """书架格子的右键菜单。"""
+        from .widgets import build_context_menu
+
+        is_local = localbooks.is_local_url(book.url)
+        entries = [("移出书架", lambda: self.shelf_remove_requested.emit(book))]
+        if is_local:
+            entries.append(("打开文件位置", lambda: self.reveal_requested.emit(book)))
+            entries.append(("删除本地书…", lambda: self.local_delete_requested.emit(book)))
+        menu = build_context_menu(tile, entries)
+        menu.exec_(tile.mapToGlobal(tile.rect().bottomLeft()))
 
     def _clear(self) -> None:
         while self.grid.count():

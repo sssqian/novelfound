@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """通用小部件：封面、提示条、空状态、自动隐藏浮条、细进度线、轻提示。
 
 设计取向见 docs/UI设计方案：界面尽量安静，控件按需出现而不是常驻。
@@ -612,3 +612,15 @@ class CoverTile(QFrame):
             self.clicked.emit(self.book)
         super().mouseReleaseEvent(event)
 
+def build_context_menu(parent: QWidget, entries) -> "QMenu":
+    """构造右键菜单：``entries`` 是 ``[(文案, 回调), ...]``（文案为 ``-`` 表示分隔线）。"""
+    from PyQt5.QtWidgets import QMenu
+
+    menu = QMenu(parent)
+    for text, callback in entries:
+        if text == "-":
+            menu.addSeparator()
+            continue
+        action = menu.addAction(text)
+        action.triggered.connect(lambda _checked=False, cb=callback: cb())
+    return menu

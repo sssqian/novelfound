@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import localbooks
 from .config import data_dir
 from .models import Book
 from .storage import atomic_write_json, read_json
@@ -137,3 +138,33 @@ class BrowseHistory:
         with self._lock:
             del self._items[max(0, keep):]
         self.save()
+
+    # ------------------------------------------------- 删除某本书 / 清理失效
+    def remove_book(self, book_key: str) -> int:
+        """删掉某本书的全部历史（一台书只剩一条，所以通常是 0 或 1 条）。"""
+        with self._lock:
+            before = len(self._items)
+            self._items = [i for i in self._items if i.get("key") != book_key]
+            removed = before - len(self._items)
+        if removed:
+            self.save()
+        return removed
+
+    def stale_local_items(self, valid_ids) -> List[Dict[str, Any]]:
+        """指向"已不存在的本地书"的历史条目。"""
+        valid = {f"local|{localbooks.local_url(i)}" for i in valid_ids}
+        return [i for i in self._items
+                if localbooks.is_local_key(i.get("key", "")) and i.get("key") not in valid]
+
+    def purge_stale_local(self, valid_ids) -> int:
+        """清掉指向已不存在本地书的历史条目，返回清掉几条。"""
+        with self._lock:
+            before = len(self._items)
+            self._items = [i for i in self._items
+                           if not (localbooks.is_local_key(i.get("key", ""))
+                                   and i.get("key") not in
+                                   {f"local|{localbooks.local_url(v)}" for v in valid_ids})]
+            removed = before - len(self._items)
+        if removed:
+            self.save()
+        return removed

@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """内置阅读器。
 
 特点：
@@ -100,12 +100,16 @@ class ReaderView(QWidget):
         self.view = QTextBrowser(self.page)
         self.view.setFrameShape(QFrame.NoFrame)
         self.view.setOpenExternalLinks(False)
-        self.view.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        # 只用 TextSelectableByMouse：**不要** TextSelectableByKeyboard——
+        # 那个标志会让 Qt 在正文左上角画一个文本光标（用户看到的"待输入的竖线"），
+        # 而它永远不会动、也不参与输入。鼠标选中/复制照常。
+        self.view.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.view.setFocusPolicy(Qt.StrongFocus)
         self.view.setMouseTracking(True)
         self.view.viewport().setMouseTracking(True)
         self.view.verticalScrollBar().valueChanged.connect(self._on_scrolled)
         self.view.viewport().installEventFilter(self)
+        self.view.installEventFilter(self)          # 按键要在这里拦（见 eventFilter）
         page_layout.addWidget(self.view, 0)
 
         # 右页整列（含栏间距）作为一个整体显示/隐藏，单页时完全不占宽度
@@ -117,11 +121,12 @@ class ReaderView(QWidget):
         self.view2 = QTextBrowser(self.right_column)
         self.view2.setFrameShape(QFrame.NoFrame)
         self.view2.setOpenExternalLinks(False)
-        self.view2.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+        self.view2.setTextInteractionFlags(Qt.TextSelectableByMouse)   # 同上：不要键盘光标
         self.view2.setFocusPolicy(Qt.StrongFocus)
         self.view2.setMouseTracking(True)
         self.view2.viewport().setMouseTracking(True)
         self.view2.viewport().installEventFilter(self)
+        self.view2.installEventFilter(self)          # 按键要在这里拦
         right_layout.addWidget(self.view2)
         self.right_column.hide()
         page_layout.addWidget(self.right_column, 0)
@@ -408,6 +413,11 @@ class ReaderView(QWidget):
     def eventFilter(self, obj, event) -> bool:  # noqa: N802
         views = {self.view.viewport(): self.view, self.view2.viewport(): self.view2}
         view = views.get(obj)
+        # 按键：正文控件（view/view2 本身）会吃掉方向键，必须在它之前拦下来
+        if event.type() == QEvent.KeyPress and obj in (self.view, self.view2):
+            if self._handle_key(event.key(), event.modifiers()):
+                event.accept()
+                return True
         if event.type() == QEvent.MouseMove and (
                 view is not None or obj in (self.canvas, self.page, self.chapter_header)):
             try:
@@ -1100,42 +1110,47 @@ class ReaderView(QWidget):
         bar.setValue(max(0, bar.value() - self.page_step()))
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
-        key = event.key()
-        modifiers = event.modifiers()
-        if modifiers & (Qt.ControlModifier | Qt.AltModifier):
-            if modifiers & Qt.ControlModifier:
-                if key in (Qt.Key_Plus, Qt.Key_Equal):
-                    self.change_font_size(1)
-                    return
-                if key == Qt.Key_Minus:
-                    self.change_font_size(-1)
-                    return
-            super().keyPressEvent(event)
+        if self._handle_key(event.key(), event.modifiers()):
+            event.accept()
             return
+        super().keyPressEvent(event)
 
-        if key in (Qt.Key_PageDown, Qt.Key_Space):
-            self.next_page()
-        elif key == Qt.Key_PageUp:
+    def _handle_key(self, key: int, modifiers) -> bool:
+        """阅读器按键：**只保留方向键翻页 + Ctrl+方向键换章**，返回是否已处理。
+
+        为什么要在 :meth:`eventFilter` 里也调用它：正文控件（``QTextBrowser``）
+        持有焦点时，按键会先被它吃掉（它在 read-only 下也会消费方向键/翻页键），
+        父控件的 ``keyPressEvent`` 根本收不到 —— 实测把 PageDown 发给正文控件，
+        页码一动不动。所以按键必须在**控件这一层**拦下来转发给阅读器。
+        """
+        ctrl = bool(modifiers & Qt.ControlModifier)
+        alt = bool(modifiers & Qt.AltModifier)
+        if alt:
+            return False
+        if ctrl:
+            # 换章：Ctrl+← / Ctrl+→
+            if key == Qt.Key_Left:
+                self._step(-1)
+                return True
+            if key == Qt.Key_Right:
+                self._step(1)
+                return True
+            return False
+        if key in (Qt.Key_Left, Qt.Key_Up):
             self.prev_page()
-        elif key == Qt.Key_Right:
-            self._step(1)
-        elif key == Qt.Key_Left:
-            self._step(-1)
-        elif key == Qt.Key_Home:
-            self.view.verticalScrollBar().setValue(0)
-        elif key == Qt.Key_End:
-            bar = self.view.verticalScrollBar()
-            bar.setValue(bar.maximum())
-        elif key == Qt.Key_Escape:
+            return True
+        if key in (Qt.Key_Right, Qt.Key_Down):
+            self.next_page()
+            return True
+        if key == Qt.Key_Escape:
             if self.settings_popover.isVisible():
                 self.settings_popover.close_popover()      # 先收设置浮层
-                return
-            if self.fullscreen_button.isChecked():
+            elif self.fullscreen_button.isChecked():
                 self.fullscreen_button.setChecked(False)
             else:
                 self.back_requested.emit()
-        else:
-            super().keyPressEvent(event)
+            return True
+        return False
 
     def wheelEvent(self, event) -> None:  # noqa: N802
         # 滚动模式下正常滚动；翻页模式下滚轮也整页跳动，手感更接近翻页

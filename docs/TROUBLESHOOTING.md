@@ -947,7 +947,72 @@ offsets.append(min(page_end, total))     # ← page_end == total 时追加了"�
 
 ---
 
-## 22. 需要你手动删除的文件
+## 22. 书架管理 / 快捷键 / 正文光标（用户实测反馈三连）
+
+### 22.1「移出书架」不清任何东西，也没有"彻底删除"入口
+用户问："重新导入 epub 时，第一次导入的我点了移出书架，不清楚缓存有没有被清"。
+查下来：`Library.remove()` **只做 `self._data["books"].pop(key)`** ——
+导入的文件、`local_books.json` 记录、章节/详情缓存、浏览历史、阅读进度**全都留着**；
+而且界面上**没有任何入口**能彻底删掉一本导入的书。
+
+**实测用户真实数据目录**（`%APPDATA%\NovelFound`）：
+
+| 位置 | 情况 |
+| --- | --- |
+| `local_books/` | 无孤儿文件（旧记录是"重新导入去重"时连文件一起删的 ✓） |
+| `cache/cache.db` | **41 行**仍指向已删的本地书（章节 39 + 详情 2） |
+| `history.json` | 30 条里有 **2 条**指向已删记录 |
+| `library.json` | 进度历史里 **2 条**指向已删记录 |
+
+**修法**：
+1. 「移出书架」与「删除本地书」分成两个动作——前者只隐藏（并提示"文件仍在本地库"），
+   后者走确认框（**显示明细**：文件大小、缓存行数、会一并清掉的记录），
+   然后级联删除：本地文件 + 封面 + 记录 + 缓存 + 浏览历史 + 阅读进度。
+2. 新增「本地书管理」窗口（书架页右上角进入）：列书名/格式/章数/占用/导入时间，
+   可删除、重新导入、打开文件位置；窗口里还有「**清理失效记录**」按钮。
+3. 后端补了 `Library.forget` / `purge_stale_local`、`BrowseHistory.remove_book` /
+   `purge_stale_local`、`Cache.delete_book` / `count_for_book` / `purge_stale_local`。
+4. 用户那 45 处失效引用已清掉（书架/进度 2、历史 2、缓存 41，复查零残留），
+   原文件备份成 `cleanup-backup-<时间戳>`。
+
+**写这段时踩的坑（单元测试当场抓到）**：清理逻辑里拿 `is_local_url()` 去判断**记录键** ——
+键是 `local|local://<id>`，用"以 `local://` 开头"去判永远不成立，于是一条都匹配不到。
+新增了 `localbooks.is_local_key()` 专管记录键，并在文档串里写明区别。
+
+### 22.2 方向键：不是"没绑定"，而是**根本没送到阅读器**
+用户要"←↑ 上一页、→↓ 下一页"。查代码发现 `ReaderView.keyPressEvent` 里**早就有**
+`PageDown/Space/PageUp/←/→` 的绑定 —— 但实测**按了没反应**：
+
+```
+事件发给 self.view（真实场景：正文控件持焦点）
+  PageDown  屏 0->0    ← 完全没反应
+  Space     屏 0->0
+  Right     屏 0->0
+事件发给 self.reader（绑定所在处）
+  PageDown  屏 0->1    ← 只有直接发给阅读器才有效
+```
+
+**根因**：焦点在正文控件（`QTextBrowser`）上时，按键先被它自己消费掉（read-only 也会
+消费方向键/翻页键），父控件的 `keyPressEvent` 收不到。**光加绑定没用，必须把按键拦下来。**
+
+**修法**：
+* 在 `view` / `view2` 上装 KeyPress 事件过滤器（和滚轮同一套路），转发给
+  `_handle_key()`；`keyPressEvent` 也走同一个函数；
+* 映射按要求重定：`←/↑` 上一页、`→/↓` 下一页、`Ctrl+←/→` 换章；
+* 按用户要求**删掉**旧绑定（`PageUp/PageDown/Space/Home/End` 与"←→ 换章"）；
+* 自检里对着**正文控件**发真实 `QKeyEvent`（不是发给 `reader`），确保走的是真实路径。
+
+### 22.3 正文左上角那条"待输入的竖线"
+来源是 `setTextInteractionFlags(TextSelectableByMouse | TextSelectableByKeyboard)`：
+Qt 的 **`TextSelectableByKeyboard` 会提供可见文本光标**，位置在第 0 字是因为每次渲染后
+`moveCursor(QTextCursor.Start)`；不闪烁与焦点/系统光标闪烁设置有关。
+
+按用户选择改成 **只用 `TextSelectableByMouse`**：竖线消失，鼠标选中/复制照常
+（自检断言 `textInteractionFlags() == TextSelectableByMouse`）。
+
+---
+
+## 23. 需要你手动删除的文件
 
 下面这些是开发/验证过程中产生、**我无法在沙箱内删除**或**建议你按需清理**的内容。
 都可以安全删除，删掉不影响程序运行（`dist/` 与 `.venv/` 除外，见备注）。

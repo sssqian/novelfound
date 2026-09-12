@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """界面自检脚本（联网，可选）。
 
 它会真实跑一遍「搜索 → 详情 → 阅读 → 书架 → 设置」流程，并做两类校验：
@@ -298,6 +298,13 @@ if ok:
         check("阅读器状态栏", "第 3 /" in window.reader.status.text(),
               window.reader.status.text())
         bar = window.reader.view.verticalScrollBar()
+        # 网络章节长度随机（实测遇到过整章只有一屏），太短就往后换一章再断言
+        if bar.maximum() == 0:
+            for candidate in range(3, min(8, len(detail.chapters))):
+                window.on_read_requested(detail, candidate)
+                if wait_for(lambda: window.reader.view.verticalScrollBar().maximum() > 0, 40):
+                    break
+            bar = window.reader.view.verticalScrollBar()
         check("正文可滚动", bar.maximum() > 0, f"max={bar.maximum()}")
 
         # ---- P0：默认主题应为暖白 #F7F3E9 ----
@@ -579,6 +586,39 @@ if ok:
               f"{spread_before} -> {window.reader._spread} "
               f"（屏数 {window.reader.spread_count()}）")
 
+        # ---- 方向键翻页：焦点在正文控件上时也必须生效 ----
+        # 回归背景：早先按键处理挂在 ReaderView 上，而正文控件（QTextBrowser）
+        # 持焦点时会自己吃掉方向键/翻页键，父控件根本收不到 —— 用户按了没反应。
+        from PyQt5.QtGui import QKeyEvent  # noqa: E402
+
+        def _press(key, modifiers=Qt.NoModifier):
+            window.reader.view.setFocus()
+            pump(0.1)
+            before = window.reader._spread
+            app.sendEvent(window.reader.view,
+                          QKeyEvent(QKeyEvent.KeyPress, key, modifiers))
+            pump(0.25)
+            return before, window.reader._spread
+
+        check("正文控件只允许鼠标选择（没有待输入光标）",
+              int(window.reader.view.textInteractionFlags())
+              == int(Qt.TextSelectableByMouse),
+              f"flags={int(window.reader.view.textInteractionFlags())}")
+        window.reader._show_spread(0)
+        pump(0.2)
+        _, spread = _press(Qt.Key_Right)
+        check("→ 翻下一页（焦点在正文控件上）", spread == 1, f"屏={spread}")
+        _, spread = _press(Qt.Key_Down)
+        check("↓ 翻下一页", spread == 2, f"屏={spread}")
+        _, spread = _press(Qt.Key_Up)
+        check("↑ 翻上一页", spread == 1, f"屏={spread}")
+        _, spread = _press(Qt.Key_Left)
+        check("← 翻上一页", spread == 0, f"屏={spread}")
+        _, spread = _press(Qt.Key_PageDown)
+        check("PageDown 已解绑（按了不翻页）", spread == 0, f"屏={spread}")
+        window.reader._show_spread(1)
+        pump(0.2)
+
         # ---- 回归：一次物理滚动只翻一屏 ----
         # 滚轮驱动/触摸板会把一格拆成多个小事件（-60+-60、-30x4），
         # 按事件翻页就会一次跳好几屏、中间内容整段丢失（用户实测反馈）。
@@ -607,12 +647,15 @@ if ok:
         window.reader._show_spread(0)
         pump(0.2)
         pieces = []
-        for _ in range(window.reader.spread_count()):
+        total_spreads = window.reader.spread_count()
+        for spread_index in range(total_spreads):
             pieces.append(window.reader.view.toPlainText())
             if window.reader._two_page:
                 pieces.append(window.reader.view2.toPlainText())
-            window.reader.next_page()
-            pump(0.12)
+            # 最后一屏不能再翻：next_page() 会跳到下一章，后面所有断言都会跟着乱
+            if spread_index < total_spreads - 1:
+                window.reader.next_page()
+                pump(0.12)
         walked = "".join("".join(pieces).split())
         original = "".join("".join(window.reader._paragraphs).split())
         check("逐屏翻完全程不丢内容", walked == original,
@@ -1401,6 +1444,86 @@ if ok:
     shot("19_catalog_groups")
     window.close_catalog_drawer()
     pump(0.4)
+
+from novelfound.ui.local_manager import LocalManagerDialog  # noqa: E402
+
+# ------------------------------------------------- 5h. 本地书管理（删除级联 / 清理失效记录）
+# 用一本**临时**书来测删除：别把后面「本地书可被搜索到」要用的那两本删掉
+_tmp_book_path = _local_dir / "临时删除测试书.txt"
+_tmp_book_path.write_text("书名：临时删除测试书\n作者：测试\n\n第一章 开端\n"
+                          + "正文内容，用于删除级联自检。" * 10 + "\n", encoding="utf-8")
+_before_count = window.local_books.count()
+window.import_local_books([str(_tmp_book_path)])
+ok = wait_for(lambda: window.local_books.count() == _before_count + 1, 60)
+check("导入临时测试书（删除用）", ok, f"{window.local_books.count()} 本")
+_lb_record = next((i for i in window.local_books.all()
+                   if i["title"] == "临时删除测试书"), None)
+if _lb_record:
+    _lb_book = window.local_books.to_book(_lb_record)
+    _lb_path = window.local_books.file_path(_lb_record)
+    # 造出"读过的本地书"：书架 + 进度 + 浏览历史 + 缓存
+    window.library.add(_lb_book, window.current_detail
+                       if window.current_detail and
+                       window.current_detail.book.key == _lb_book.key else None)
+    window.library.update_progress(_lb_book, f"{_lb_book.url}/0", "第一章 开端", 0)
+    window.history.record(_lb_book, kind="detail")
+    window.cache.put_chapter("local", _lb_book.url, f"{_lb_book.url}/0",
+                             "第一章", ["正文"])
+    _details = window.local_book_details(_lb_record)
+    check("删除明细含文件大小与缓存行数",
+          _details["size"] > 0 and _details["cache_rows"] >= 1,
+          f"{_details['size_text']} / 缓存 {_details['cache_rows']} 行 / "
+          f"书架={_details['in_library']} 历史={_details['in_history']}")
+
+    ok = window.delete_local_book(_lb_record, confirm=False)   # 自检里跳过确认框
+    check("删除本地书成功", ok, "")
+    check("删除后文件已消失", not _lb_path.exists(), str(_lb_path))
+    check("删除后记录已消失", window.local_books.get(_lb_record["id"]) is None, "")
+    check("删除后书架条目已清", not window.library.contains(_lb_book.key), "")
+    check("删除后阅读进度已清",
+          not window.library.progress(_lb_book.key).get("chapter_url"), "")
+    check("删除后浏览历史已清",
+          not any(i.get("key") == _lb_book.key for i in window.history.items()), "")
+    check("删除后缓存已清",
+          window.cache.count_for_book("local", _lb_book.url) == 0, "")
+
+    # 造一条"失效记录"（模拟删掉记录但历史/进度/缓存里还留着），验证清理按钮
+    _ghost = "local|local://deadbeef0001"
+    window.library._data["books"][_ghost] = {"key": _ghost, "title": "已删的书",
+                                             "url": "local://deadbeef0001",
+                                             "source": "local"}
+    window.library.save()
+    window.history._items.insert(0, {"key": _ghost, "title": "已删的书",
+                                     "url": "local://deadbeef0001",
+                                     "source": "local", "kind": "detail",
+                                     "at": 0})
+    window.history.save()
+    window.cache.put_chapter("local", "local://deadbeef0001",
+                             "local://deadbeef0001/0", "第一章", ["正文"])
+    window.library._data["books"][_ghost] = {"key": _ghost, "title": "已删的书",
+                                             "url": "local://deadbeef0001",
+                                             "source": "local"}
+    window.library.save()
+    _clean = window.cleanup_stale_records()
+    check("清理失效记录：书架/进度",
+          _clean["library"] >= 1 and not window.library.contains(_ghost),
+          str(_clean))
+    check("清理失效记录：浏览历史", _clean["history"] >= 1, str(_clean))
+    check("清理失效记录：缓存", _clean["cache"] >= 1, str(_clean))
+
+    # 管理窗口能列出已导入的书
+    _mgr = LocalManagerDialog(window.local_books, window.library, window.history,
+                              window.cache,
+                              on_delete=lambda item: None,
+                              on_cleanup=lambda: {},
+                              parent=window)
+    _mgr.show()
+    pump(0.3)
+    check("本地书管理窗口列出已导入的书",
+          len(_mgr.row_titles()) == window.local_books.count()
+          and "占用" in _mgr.summary.text(),
+          f"{_mgr.row_titles()} / {_mgr.summary.text()}")
+    _mgr.close()
 
 # 搜索里也能搜到本地书
 window.open_search_palette("本地测试书")

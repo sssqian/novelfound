@@ -39,7 +39,18 @@ def book_id_from_url(url: str) -> str:
 
 
 def is_local_url(url: str) -> bool:
+    """是不是本地书的伪地址（``local://<id>``）。"""
     return bool(url) and url.startswith(URL_PREFIX)
+
+
+def is_local_key(key: str) -> bool:
+    """是不是本地书的**记录键**（``local|local://<id>``）。
+
+    注意别拿 :func:`is_local_url` 判记录键：键里带书源前缀 ``local|``，
+    用"以 ``local://`` 开头"去判永远不成立（写"清理失效记录"时踩过，
+    结果一条都匹配不到）。
+    """
+    return bool(key) and key.startswith(f"{SOURCE_KEY}|{URL_PREFIX}")
 
 
 class LocalBooks:

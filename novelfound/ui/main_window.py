@@ -23,6 +23,8 @@ P1 信息架构（见 ``docs/UI重构实施方案.md``）：
 from __future__ import annotations
 
 import base64
+import subprocess
+import sys
 import time
 from typing import Dict, List, Optional
 
@@ -47,6 +49,7 @@ from .book_view import BookView
 from .catalog_drawer import CatalogDrawer
 from .history_panel import HistoryPanel
 from .image_gallery import ImageGalleryDialog
+from .local_manager import LocalManagerDialog, human_size
 from .library_view import LibraryView
 from .reader import ReaderView
 from .search_palette import SearchPalette
@@ -158,6 +161,10 @@ class MainWindow(QMainWindow):
         self.library_view.book_opened.connect(self.on_book_clicked)
         self.library_view.search_requested.connect(self.open_search_palette)
         self.library_view.import_requested.connect(self.open_import_dialog)
+        self.library_view.manage_requested.connect(self.open_local_manager)
+        self.library_view.shelf_remove_requested.connect(self.remove_from_shelf)
+        self.library_view.local_delete_requested.connect(self.on_local_delete_requested)
+        self.library_view.reveal_requested.connect(self.reveal_local_file)
         self.stack.addWidget(self.library_view)
 
         self.book_view = BookView(self.stack)
@@ -166,6 +173,7 @@ class MainWindow(QMainWindow):
         self.book_view.refresh_requested.connect(self.on_refresh_detail)
         self.book_view.back_requested.connect(self.on_book_back)
         self.book_view.catalog_requested.connect(self.open_catalog_drawer)
+        self.book_view.local_delete_requested.connect(self.on_local_delete_requested)
         self.stack.addWidget(self.book_view)
 
         self.reader = ReaderView(self.config, self.stack)
@@ -313,9 +321,149 @@ class MainWindow(QMainWindow):
         item = self.local_books.get(localbooks.book_id_from_url(book.url))
         return len((item or {}).get("images") or [])
 
+    # ------------------------------------------------------------- 本地书管理
+    def local_record(self, book: Book) -> Optional[dict]:
+        """取这本书对应的本地库记录（不是本地书则为 None）。"""
+        if not localbooks.is_local_url(book.url):
+            return None
+        return self.local_books.get(localbooks.book_id_from_url(book.url))
+
+    def local_book_details(self, item: dict) -> dict:
+        """删除前给用户看的明细：文件多大、缓存几行、历史/进度有没有。"""
+        path = self.local_books.file_path(item)
+        size = path.stat().st_size if path.is_file() else 0
+        cover = item.get("cover_file")
+        if cover and (self.local_books.files_dir / cover).is_file():
+            size += (self.local_books.files_dir / cover).stat().st_size
+        book = self.local_books.to_book(item)
+        return {
+            "size": size,
+            "size_text": human_size(size),
+            "chapters": len(item.get("chapters") or []),
+            "cache_rows": (self.cache.count_for_book(localbooks.SOURCE_KEY, book.url)
+                           if self.cache else 0),
+            "in_history": any(i.get("key") == book.key for i in self.history.items()),
+            "in_library": self.library.contains(book.key),
+            "in_progress": bool(self.library.progress(book.key).get("chapter_url")),
+            "book": book,
+        }
+
+    def remove_from_shelf(self, book: Book) -> None:
+        """「移出书架」：只从书架隐藏；本地书额外提示文件仍保留。"""
+        if self.library.contains(book.key):
+            self.library.remove(book.key)
+        if localbooks.is_local_url(book.url):
+            self.toast.show_message(
+                "已移出书架；导入的文件仍在本地库里（搜索能找到）。"
+                "要连文件一起删，用「本地书管理 → 删除选中」。")
+        else:
+            self.toast.show_message("已移出书架")
+        self._refresh_library()
+        if self.current_book is not None and self.current_book.key == book.key:
+            self.book_view.set_shelf_state(False)
+
+    def delete_local_book(self, item: dict, confirm: bool = True) -> bool:
+        """彻底删除一本导入的本地书：文件 + 记录 + 缓存 + 浏览历史 + 阅读进度。"""
+        info = self.local_book_details(item)
+        book = info["book"]
+        if confirm:
+            lines = [f"《{book.title}》（{str(item.get('format', '')).upper()}，"
+                     f"{info['chapters']} 章）", "",
+                     f"· 本地文件：{info['size_text']}",
+                     f"· 阅读缓存：{info['cache_rows']} 行"]
+            extras = [name for name, flag in (("书架", info["in_library"]),
+                                              ("阅读进度", info["in_progress"]),
+                                              ("浏览历史", info["in_history"])) if flag]
+            lines.append(f"· 记录：{'、'.join(extras) if extras else '无'}")
+            lines += ["", "删除后无法恢复（要看得重新导入文件）。"]
+            box = QMessageBox(self)
+            box.setWindowTitle("删除本地书")
+            box.setIcon(QMessageBox.Warning)
+            box.setText("\n".join(lines))
+            yes = box.addButton("删除", QMessageBox.DestructiveRole)
+            box.addButton("取消", QMessageBox.RejectRole)
+            box.exec_()
+            if box.clickedButton() is not yes:
+                return False
+
+        removed_cache = (self.cache.delete_book(localbooks.SOURCE_KEY, book.url)
+                         if self.cache else 0)
+        removed_history = self.history.remove_book(book.key)
+        self.library.forget(book.key)
+        self.local_books.remove(item.get("id", ""))
+        self.sources = build_sources(self.config, self.http)
+        self._refresh_source_status()
+        self._refresh_library()
+        self._refresh_history_badge()
+        if self.current_book is not None and self.current_book.key == book.key:
+            self.show_library()
+        self.toast.show_message(
+            f"已删除《{book.title}》：文件 + 缓存 {removed_cache} 行"
+            f" + 历史 {removed_history} 条 + 进度记录")
+        return True
+
+    def cleanup_stale_records(self) -> dict:
+        """清理指向"已不存在的本地书"的记录（书架/进度/历史/缓存）。"""
+        valid_ids = [item.get("id") for item in self.local_books.all()]
+        valid_urls = [localbooks.local_url(i) for i in valid_ids]
+        result = {
+            "library": self.library.purge_stale_local(valid_ids),
+            "history": self.history.purge_stale_local(valid_ids),
+            "cache": self.cache.purge_stale_local(valid_urls) if self.cache else 0,
+        }
+        self._refresh_library()
+        self._refresh_history_badge()
+        summary = (f"清理失效记录：书架/进度 {result['library']} 条、"
+                   f"历史 {result['history']} 条、缓存 {result['cache']} 行")
+        self.toast.show_message(summary)
+        self.statusBar().showMessage(summary)
+        return result
+
+    def on_local_delete_requested(self, book: Book) -> None:
+        """详情页按钮 / 书架右键点了「删除本地书」。"""
+        item = self.local_record(book)
+        if item is None:
+            self.toast.show_message("这本书不在本地库里（可能已被删除）。")
+            return
+        self.delete_local_book(item, confirm=True)
+
+    def open_local_manager(self) -> None:
+        """打开「本地书管理」窗口。"""
+        dialog = LocalManagerDialog(
+            self.local_books, self.library, self.history, self.cache,
+            on_delete=lambda item: self.delete_local_book(item, confirm=True),
+            on_cleanup=self.cleanup_stale_records,
+            on_reimport=self.reimport_local_book,
+            parent=self)
+        self.local_manager_dialog = dialog
+        dialog.exec_()
+
+    def reimport_local_book(self, item: dict) -> None:
+        """重新导入：选一个新文件替换这本书。"""
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, f"重新导入《{item.get('title', '')}》", "",
+            "电子书 (*.txt *.epub);;所有文件 (*)")
+        if paths:
+            self.import_local_books(paths)
+
+    def reveal_local_file(self, book: Book) -> None:
+        """在资源管理器里定位导入的文件。"""
+        item = self.local_record(book)
+        if not item:
+            return
+        path = self.local_books.file_path(item)
+        if not path.is_file():
+            self.toast.show_message("文件已不在，可能已被删除。")
+            return
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", "/select,", str(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path.parent)])
+
     def open_image_gallery(self) -> None:
         """打开「本书插图」：列出 EPUB 包里的所有图片（含正文没引用的）。"""
-        book = self.current_book
         if book is None or not localbooks.is_local_url(book.url):
             self.toast.show_message("这本书没有插图可看（只有本地 EPUB 支持）。")
             return
@@ -558,6 +706,7 @@ class MainWindow(QMainWindow):
         self.book_view.set_detail(detail, in_shelf=self.library.contains(book.key),
                                   cached_count=cached,
                                   progress=self.library.progress(book.key))
+        self.book_view.set_local(is_local=localbooks.is_local_url(book.url))
         if self.config.get("auto_load_cover") and book.cover_url:
             self._load_cover(book.cover_url, self.book_view.set_cover,
                              self.book_view.cover)

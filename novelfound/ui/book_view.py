@@ -34,6 +34,7 @@ class BookView(QWidget):
     refresh_requested = pyqtSignal(object)       # (Book)
     back_requested = pyqtSignal()
     catalog_requested = pyqtSignal()             # 打开目录抽屉
+    local_delete_requested = pyqtSignal(object)  # (Book) 删除本地书
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -106,6 +107,14 @@ class BookView(QWidget):
         self.refresh_button.clicked.connect(
             lambda: self.detail and self.refresh_requested.emit(self.detail.book))
         buttons.addWidget(self.refresh_button)
+
+        # 本地导入的书才有「删除本地书」（连文件、缓存、历史一起清）
+        self.delete_button = QPushButton("🗑 删除本地书…", self)
+        self.delete_button.setObjectName("ghost")
+        self.delete_button.setToolTip("删除导入的文件、缓存、浏览历史与阅读进度（不可恢复）")
+        self.delete_button.clicked.connect(self._on_delete_clicked)
+        self.delete_button.setVisible(False)
+        buttons.addWidget(self.delete_button)
         buttons.addStretch(1)
         info.addLayout(buttons)
         info.addStretch(1)
@@ -135,12 +144,26 @@ class BookView(QWidget):
         root.addStretch(1)
 
     # ------------------------------------------------------------------ 数据
+    def set_local(self, is_local: bool) -> None:
+        """是不是本地导入的书（决定「删除本地书」按钮是否出现）。"""
+        self.delete_button.setVisible(bool(is_local))
+
+    def _on_delete_clicked(self) -> None:
+        if self.detail is not None:
+            self.local_delete_requested.emit(self.detail.book)
+
+    def set_shelf_state(self, in_shelf: bool) -> None:
+        self._in_shelf = in_shelf
+        self.shelf_button.setText("★ 已在书架" if in_shelf else "☆ 加入书架")
+
     def set_detail(self, detail: BookDetail, in_shelf: bool = False,
                    cached_count: int = 0, progress: Optional[dict] = None) -> None:
         self.detail = detail
         book = detail.book
         self._in_shelf = in_shelf
         self._intro_expanded = False
+        # 切换书籍时先按"是否本地书"决定删除按钮，避免沿用上一本的可见状态
+        self.delete_button.setVisible(False)
 
         self.cover.clear_image()
         self.cover.set_title(book.title)
